@@ -333,6 +333,25 @@ def download_file(filename: str):
     # Em produção, retornar arquivo real
     return {"message": "File download not implemented"}
 
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+
+# Servir HTML como raiz
+@app.get("/")
+def serve_html():
+    """Serve HTML interface at root"""
+    html_path = os.path.join(os.path.dirname(__file__), "../../web-deploy/index.html")
+    if os.path.exists(html_path):
+        with open(html_path, "r", encoding="utf-8") as f:
+            from fastapi.responses import HTMLResponse
+            return HTMLResponse(content=f.read())
+    return {"message": "Auditoria Anuário UnB API", "status": "online"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
