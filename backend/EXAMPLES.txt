@@ -1,0 +1,295 @@
+# Exemplos de Uso da API - Auditoria Anuário UnB
+
+## 1. CRIAR REVIEW (com extração automática de TOC)
+## ================================================
+
+curl -X POST "http://localhost:8000/reviews" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_url": "https://anuariounb2025.netlify.app/",
+    "report_year": 2025,
+    "base_year": 2024
+  }'
+
+# Resposta esperada:
+# {
+#   "id": 1,
+#   "start_url": "https://anuariounb2025.netlify.app/",
+#   "report_year": 2025,
+#   "base_year": 2024,
+#   "created_at": "2025-02-18T14:30:00"
+# }
+
+
+## 2. OBTER INFORMAÇÕES DA REVIEW
+## ================================
+
+curl "http://localhost:8000/reviews/1"
+
+# Resposta:
+# {
+#   "id": 1,
+#   "start_url": "https://anuariounb2025.netlify.app/",
+#   "report_year": 2025,
+#   "base_year": 2024,
+#   "created_at": "2025-02-18T14:30:00"
+# }
+
+
+## 3. LISTAR TODAS AS SEÇÕES EXTRAÍDAS
+## ====================================
+
+curl "http://localhost:8000/reviews/1/sections"
+
+# Resposta:
+# [
+#   {
+#     "id": 1,
+#     "review_id": 1,
+#     "title": "Apresentação",
+#     "url": "https://anuariounb2025.netlify.app/index.html",
+#     "anchor": null,
+#     "level": 1,
+#     "is_virtual": false
+#   },
+#   {
+#     "id": 2,
+#     "review_id": 1,
+#     "title": "Dados Gerais",
+#     "url": "https://anuariounb2025.netlify.app/dados.html",
+#     "anchor": "#section-dados",
+#     "level": 2,
+#     "is_virtual": false
+#   }
+# ]
+
+
+## 4. RODAR CHECAGENS PARA UMA SEÇÃO ESPECÍFICA
+## =============================================
+
+# Rodar checagens na seção ID 1 (Apresentação)
+curl -X POST "http://localhost:8000/reviews/1/sections/1/run-checks"
+
+# Resposta:
+# {
+#   "id": 1,
+#   "mode": "section",
+#   "started_at": "2025-02-18T14:31:00",
+#   "finished_at": "2025-02-18T14:31:03",
+#   "results": [
+#     {
+#       "id": 1,
+#       "rule": "R1_wrong_anuario_year",
+#       "severity": "FAIL",
+#       "message": "Anuário deve ser 2025, encontrado 2024",
+#       "evidence_json": {
+#         "text_snippet": "...Anuário Estatístico 2024...",
+#         "url": "https://anuariounb2025.netlify.app/index.html",
+#         "anchor": ""
+#       }
+#     },
+#     {
+#       "id": 2,
+#       "rule": "R1_invalid_year_format",
+#       "severity": "FAIL",
+#       "message": "Ano inválido detectado: 20234",
+#       "evidence_json": {
+#         "text_snippet": "...Sumário 20234...",
+#         "url": "https://anuariounb2025.netlify.app/index.html",
+#         "anchor": ""
+#       }
+#     }
+#   ]
+# }
+
+
+## 5. OBTER RESULTADOS DE CHECAGEM DE UMA SEÇÃO
+## =============================================
+
+curl "http://localhost:8000/reviews/1/sections/1/results"
+
+# Retorna o último check run para essa seção
+
+
+## 6. RODAR CHECAGENS PARA TODAS AS PÁGINAS
+## =========================================
+
+# Inicia processamento em background, limitado a 50 páginas
+curl -X POST "http://localhost:8000/reviews/1/run-all?max_pages=50"
+
+# Resposta imediata:
+# {
+#   "message": "Checagens iniciadas",
+#   "review_id": 1,
+#   "max_pages": 50,
+#   "status": "processing"
+# }
+# (Processamento continua em background)
+
+
+## 7. SALVAR REVISÃO MANUAL PARA UMA SEÇÃO
+## =======================================
+
+curl -X POST "http://localhost:8000/reviews/1/sections/1/manual" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items_checked_json": {
+      "gramatica_verificada": true,
+      "tabelas_validadas": true,
+      "dados_confirmados": false
+    },
+    "comments": "Seção revisada. Encontrados 2 erros gramaticais menores. Tabelas estão corretas. Dados precisam confirmação com financeiro.",
+    "reviewer": "Maria Silva"
+  }'
+
+# Resposta:
+# {
+#   "id": 1,
+#   "section_id": 1,
+#   "items_checked_json": {...},
+#   "comments": "...",
+#   "reviewer": "Maria Silva",
+#   "updated_at": "2025-02-18T14:32:00"
+# }
+
+
+## 8. EXPORTAR RELATÓRIO EM HTML
+## =============================
+
+curl "http://localhost:8000/reviews/1/export?format=html"
+
+# Resposta:
+# {
+#   "message": "Relatório gerado",
+#   "filename": "report_review_1_20250218_143200.html",
+#   "download_url": "/downloads/report_review_1_20250218_143200.html"
+# }
+
+
+## 9. EXPORTAR RELATÓRIO EM PDF (se WeasyPrint disponível)
+## =======================================================
+
+curl "http://localhost:8000/reviews/1/export?format=pdf"
+
+# Resposta:
+# {
+#   "message": "Relatório gerado",
+#   "filename": "report_review_1_20250218_143200.pdf",
+#   "download_url": "/downloads/report_review_1_20250218_143200.pdf"
+# }
+
+
+## 10. BAIXAR ARQUIVO GERADO
+## =========================
+
+# Baixar relatório HTML
+curl "http://localhost:8000/downloads/report_review_1_20250218_143200.html" \
+  -o relatorio.html
+
+# Baixar relatório PDF
+curl "http://localhost:8000/downloads/report_review_1_20250218_143200.pdf" \
+  -o relatorio.pdf
+
+
+## 11. ROOT ENDPOINT (informações da API)
+## ======================================
+
+curl "http://localhost:8000/"
+
+# Resposta:
+# {
+#   "name": "Auditoria Anuário Estatístico UnB",
+#   "version": "0.1.0",
+#   "endpoints": [...]
+# }
+
+
+## ============================================
+## WORKFLOW COMPLETO (sequência típica)
+## ============================================
+
+# 1. Criar review
+REVIEW=$(curl -s -X POST "http://localhost:8000/reviews" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start_url": "https://anuariounb2025.netlify.app/",
+    "report_year": 2025,
+    "base_year": 2024
+  }')
+REVIEW_ID=$(echo $REVIEW | jq '.id')
+
+# 2. Aguardar extração de TOC
+sleep 3
+
+# 3. Listar seções extraídas
+curl "http://localhost:8000/reviews/$REVIEW_ID/sections" | jq '.'
+
+# 4. Rodar checagens em todas as páginas
+curl -X POST "http://localhost:8000/reviews/$REVIEW_ID/run-all?max_pages=50"
+
+# 5. Aguardar processamento
+sleep 10
+
+# 6. Exportar relatório
+EXPORT=$(curl -s "http://localhost:8000/reviews/$REVIEW_ID/export?format=html")
+FILENAME=$(echo $EXPORT | jq -r '.filename')
+
+# 7. Baixar relatório
+curl "http://localhost:8000/downloads/$FILENAME" -o relatorio.html
+
+echo "Relatório salvo: relatorio.html"
+
+
+## ============================================
+## TRATAMENTO DE ERROS
+## ============================================
+
+# Erro: Review não encontrada
+# curl "http://localhost:8000/reviews/999"
+# Resposta: 404 Not Found
+# { "detail": "Review não encontrada" }
+
+# Erro: Arquivo não encontrado para download
+# curl "http://localhost:8000/downloads/nao_existe.html"
+# Resposta: 404 Not Found
+# { "detail": "Arquivo não encontrado" }
+
+# Erro: Formato inválido
+# curl "http://localhost:8000/reviews/1/export?format=xml"
+# Resposta: 400 Bad Request
+# { "detail": "Formato deve ser 'html' ou 'pdf'" }
+
+
+## ============================================
+## DICAS E TRUQUES
+## ============================================
+
+# Salvar response em arquivo JSON
+curl -s "http://localhost:8000/reviews/1/sections" | jq '.' > sections.json
+
+# Contar número de seções
+curl -s "http://localhost:8000/reviews/1/sections" | jq 'length'
+
+# Filtrar seções por nível
+curl -s "http://localhost:8000/reviews/1/sections" | jq '.[] | select(.level==1)'
+
+# Ver só os títulos
+curl -s "http://localhost:8000/reviews/1/sections" | jq -r '.[].title'
+
+# Contar resultados FAIL
+curl -s "http://localhost:8000/reviews/1/sections/1/results" \
+  | jq '[.results[] | select(.severity=="FAIL")] | length'
+
+# Pretty print de um resultado
+curl -s "http://localhost:8000/reviews/1/sections/1/results" | jq '.results[0]'
+
+# Monitorar status com polling
+while true; do
+  STATUS=$(curl -s "http://localhost:8000/reviews/1/sections/1/results" | jq -r '.finished_at')
+  if [ "$STATUS" != "null" ]; then
+    echo "Processamento concluído!"
+    break
+  fi
+  echo "Aguardando..."
+  sleep 2
+done

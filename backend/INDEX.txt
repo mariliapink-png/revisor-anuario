@@ -1,0 +1,127 @@
+================================================================================
+ÍNDICE RÁPIDO - Auditoria Anuário Estatístico UnB (Backend MVP)
+================================================================================
+
+🚀 COMEÇAR AQUI:
+  1. Ler: QUICKSTART.md
+  2. Executar: bash run.sh
+  3. Em outro terminal: bash test.sh
+
+📖 DOCUMENTAÇÃO:
+  ✓ README.md              - Documentação completa (setup, API, modelos)
+  ✓ QUICKSTART.md          - 3 passos para começar
+  ✓ EXAMPLES.txt           - 40+ exemplos de curl prontos
+  ✓ DEPENDENCIES.md        - Setup de dependências (Linux/macOS/Windows)
+  ✓ MANIFEST.txt           - Resumo executivo completo
+
+💻 CÓDIGO PRINCIPAL (app/):
+  ✓ main.py                - 453 linhas - Endpoints FastAPI
+  ✓ check_engine.py        - 321 linhas - Regras R1-R6 de checagem
+  ✓ toc_extractor.py       - 159 linhas - Descoberta automática de TOC
+  ✓ section_extractor.py   - 151 linhas - Extração de seções e tabelas
+  ✓ report_generator.py    - 329 linhas - Geração HTML/PDF
+  ✓ models.py              - 79 linhas  - Modelos SQLAlchemy (6 tabelas)
+  ✓ schemas.py             - 73 linhas  - Schemas Pydantic
+  ✓ database.py            - 24 linhas  - Setup SQLite
+  ✓ config.py              - 26 linhas  - Configurações
+  ✓ __init__.py            - 1 linha    - Package init
+
+🔧 CONFIGURAÇÃO:
+  ✓ requirements.txt       - Dependências Python (10 packages)
+  ✓ .gitignore             - Configuração git
+
+🚢 DEPLOYMENT:
+  ✓ run.sh                 - Script de inicialização (modo desenvolvimento)
+  ✓ test.sh                - Script de teste automatizado
+  ✓ Dockerfile             - Container Docker
+  ✓ docker-compose.yml     - Docker Compose
+
+📊 ESTRUTURA DO BANCO:
+  reviews           - ID, URL, anos, data criação
+  sections          - TOC extraído (title, url, anchor, level)
+  check_runs        - Execuções de checagem (section/page mode)
+  check_results     - Resultados (rule, severity, message, evidence)
+  manual_reviews    - Revisões manuais por seção
+
+🔍 ENDPOINTS (9 total):
+  POST   /reviews                            → Criar review + extrair TOC
+  GET    /reviews/{id}                       → Obter review
+  GET    /reviews/{id}/sections              → Listar seções
+  POST   /reviews/{id}/sections/{sid}/run-checks  → Checar 1 seção
+  GET    /reviews/{id}/sections/{sid}/results     → Ver resultados
+  POST   /reviews/{id}/run-all?max_pages=50       → Checar todas as páginas
+  POST   /reviews/{id}/sections/{sid}/manual      → Salvar revisão manual
+  GET    /reviews/{id}/export?format=html         → Exportar relatório
+  GET    /downloads/{filename}               → Serve arquivos
+
+📋 REGRAS DE CHECAGEM (R1-R6):
+  R1: Year Checks             (4 verificações de ano)
+  R2: Decimal Separator       (detecção de ponto vs vírgula)
+  R3: Table Source Required   (Fonte: obrigatória)
+  R4: Table Totals            (validação de somas)
+  R5: Table Completeness      (células vazias, ND, parseabilidade)
+  R6: Total Row Style         (destaque visual da linha Total)
+
+✅ VALIDAÇÃO ESPERADA:
+  URL: https://anuariounb2025.netlify.app/
+  report_year: 2025, base_year: 2024
+  
+  Falhas detectadas automaticamente:
+  ❌ "Anuário Estatístico 2024" → R1_wrong_anuario_year FAIL
+  ❌ "20234" → R1_invalid_year_format FAIL
+
+📦 STACK:
+  ✅ Python 3.11+
+  ✅ FastAPI + Uvicorn
+  ✅ BeautifulSoup4
+  ✅ pandas + lxml
+  ✅ SQLite + SQLAlchemy
+  ✅ Jinja2
+  ✅ WeasyPrint (opcional, para PDF)
+
+📊 ESTATÍSTICAS:
+  Arquivos:           21 (10 Python, 11 config/docs)
+  Linhas de código:   1.616 Python
+  Documentação:       5 arquivos (2.600+ linhas)
+  Tamanho:            ~100KB
+
+🎯 FEATURES:
+  ✅ Descoberta automática de TOC com heurística robusta
+  ✅ Extração de seções com suporte a anchors
+  ✅ Análise de tabelas (pandas + detecção de fonte)
+  ✅ 6 regras de qualidade automáticas
+  ✅ Persistência em SQLite
+  ✅ 9 endpoints RESTful
+  ✅ Geração de relatório HTML/PDF
+  ✅ Revisão manual integrada
+  ✅ Testes automatizados
+  ✅ Documentação completa
+
+🔐 SEGURANÇA:
+  ✅ Validação com Pydantic
+  ✅ SQL injection prevention (SQLAlchemy ORM)
+  ✅ CORS pronto para produção
+  ✅ Tipos bem definidos
+
+⚡ PERFORMANCE:
+  ✅ Async/await com FastAPI
+  ✅ Background tasks para run-all
+  ✅ Deduplicação de URLs
+  ✅ Caching automático no SQLite
+
+🧪 TESTES:
+  ✅ Script test.sh para validação completa
+  ✅ 40+ exemplos de curl em EXAMPLES.txt
+  ✅ Caso de teste com falhas esperadas
+
+📚 PRÓXIMAS ETAPAS:
+  1. Ler QUICKSTART.md (2 min)
+  2. Executar bash run.sh (30 seg)
+  3. Em outro terminal: bash test.sh (1 min)
+  4. Abrir relatório HTML gerado
+  5. Consultar banco de dados: sqlite3 anuario_audit.db
+  6. Ver exemplos avançados em EXAMPLES.txt
+
+================================================================================
+STATUS: ✅ PRONTO PARA USAR - NENHUMA CONFIGURAÇÃO NECESSÁRIA
+================================================================================

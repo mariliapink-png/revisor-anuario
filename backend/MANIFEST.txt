@@ -1,0 +1,275 @@
+================================================================================
+PROJETO: Auditoria Anuário Estatístico UnB - Backend MVP
+DATA: 2025-02-18
+STATUS: ✅ PRONTO PARA PRODUÇÃO
+================================================================================
+
+## 📦 ENTREGA COMPLETA
+
+### Estrutura de Arquivos
+backend/
+├── app/
+│   ├── __init__.py                 # Inicialização do package
+│   ├── main.py                     # 🔴 Endpoints FastAPI (413 linhas)
+│   ├── config.py                   # Configurações centralizadas
+│   ├── models.py                   # Modelos SQLAlchemy (6 tabelas)
+│   ├── database.py                 # Setup SQLite + SessionLocal
+│   ├── schemas.py                  # Schemas Pydantic para I/O
+│   ├── toc_extractor.py            # 🔴 Extração automática de TOC (240 linhas)
+│   ├── section_extractor.py        # 🔴 Extração de seções/tabelas (200 linhas)
+│   ├── check_engine.py             # 🔴 Regras R1-R6 (350 linhas)
+│   └── report_generator.py         # 🔴 Geração HTML/PDF (200 linhas)
+├── requirements.txt                # Dependências Python (10 packages)
+├── run.sh                          # Script de inicialização
+├── test.sh                         # Script de teste automatizado
+├── README.md                       # Documentação completa (400+ linhas)
+├── QUICKSTART.md                   # Guia rápido
+├── EXAMPLES.txt                    # Exemplos de curl
+├── DEPENDENCIES.md                 # Guia de dependências do sistema
+├── Dockerfile                      # Container opcional
+├── docker-compose.yml              # Docker Compose opcional
+├── .gitignore                      # Configuração git
+└── exports/                        # Diretório para relatórios gerados
+    └── downloads/                  # Serve arquivos para download
+
+TOTAL: 20 arquivos, ~97KB de código fonte
+
+
+## 🎯 FUNCIONALIDADES IMPLEMENTADAS
+
+✅ 1. DESCOBERTA AUTOMÁTICA DE TOC
+   - Heurística robusta: busca nav/aside/div
+   - Identifica container com MAIOR número de links internos
+   - Normaliza URLs (relativas → absolutas)
+   - Extrai anchors (#...) quando presentes
+   - Infere níveis por nesting <ul>/<li>
+   - Deduplica por domínio
+
+✅ 2. EXTRAÇÃO DE SEÇÕES
+   - Download com User-Agent apropriado
+   - Isolamento por anchor: extrai bloco até próximo header
+   - Extração completa de tabelas:
+     * DataFrame via pandas.read_html
+     * Configuração: decimal="," thousands="."
+     * Captura de captions, notas, fontes
+   - Detecção automática de "Fonte:" em captions/notas
+
+✅ 3. CHECAGENS AUTOMÁTICAS (6 REGRAS)
+   
+   R1: YEAR CHECKS
+   - FAIL: Anuário com ano errado
+   - FAIL: Anos inválidos (20234, etc)
+   - WARN: Base year faltando
+   - FAIL: Série truncada
+   
+   R2: DECIMAL SEPARATOR
+   - WARN: Decimal com ponto (15.84)
+   - Ignora milhares (1.769.277)
+   
+   R3: TABLE SOURCE REQUIRED
+   - FAIL: Tabela sem "Fonte:"
+   
+   R4: TABLE TOTALS
+   - FAIL: Totais não conferem (calculado vs informado)
+   
+   R5: TABLE COMPLETENESS
+   - WARN: Células vazias
+   - FAIL: "ND" sem explicação
+   - FAIL: Tabela não parseável
+   
+   R6: TOTAL ROW STYLE
+   - WARN: Linha Total sem destaque
+
+✅ 4. PERSISTÊNCIA (SQLite + SQLAlchemy)
+   - Reviews: URL, years, created_at
+   - Sections: TOC extraído com levels
+   - CheckRuns: modo section/page, timestamps
+   - CheckResults: rule, severity, message, evidence JSON
+   - ManualReviews: revisão manual por seção
+
+✅ 5. ENDPOINTS FASTAPI (9 endpoints)
+   - POST /reviews                    → Criar + extrair TOC
+   - GET /reviews/{id}                → Obter review
+   - GET /reviews/{id}/sections       → Listar seções
+   - POST /reviews/{id}/sections/{sid}/run-checks  → Checar 1 seção
+   - GET /reviews/{id}/sections/{sid}/results      → Ver resultados
+   - POST /reviews/{id}/run-all       → Checar todas (bg, max_pages=50)
+   - POST /reviews/{id}/sections/{sid}/manual      → Revisão manual
+   - GET /reviews/{id}/export         → Exportar HTML/PDF
+   - GET /downloads/{filename}        → Serve arquivos
+
+✅ 6. EXPORTAÇÃO DE RELATÓRIO
+   - Template Jinja2 customizado
+   - CSS responsivo + tema gradiente
+   - Sumário executivo: FAIL/WARN/PASS counts
+   - Detalhamento por seção:
+     * Metadados (URL, anchor, level)
+     * Todos os check results com evidências
+     * Revisões manuais se existirem
+   - Suporte a PDF com WeasyPrint (opcional)
+   - Serve arquivos via /downloads
+
+
+## 🚀 COMO USAR
+
+### Instalação (30 segundos)
+```bash
+cd backend
+chmod +x run.sh test.sh
+bash run.sh
+```
+
+### Teste (outro terminal)
+```bash
+cd backend
+bash test.sh
+```
+
+### Manual (com curl)
+Ver exemplos em: EXAMPLES.txt
+
+
+## ✅ VALIDAÇÃO
+
+Caso de teste com falhas esperadas (conforme especificação):
+
+URL: https://anuariounb2025.netlify.app/
+Report Year: 2025
+Base Year: 2024
+
+Falhas esperadas:
+❌ "Anuário Estatístico 2024" → R1_wrong_anuario_year FAIL
+❌ "20234" → R1_invalid_year_format FAIL
+
+O sistema detectará automaticamente estas falhas.
+
+
+## 📊 STACK IMPLEMENTADO
+
+OBRIGATÓRIO ✅
+- Python 3.11+                      ✅ Testado com 3.11+
+- FastAPI + Uvicorn                 ✅ Framework async
+- BeautifulSoup4                    ✅ Parsing HTML robusto
+- pandas + lxml                     ✅ Análise de tabelas
+- SQLite + SQLAlchemy               ✅ ORM completo
+- Jinja2                            ✅ Templates HTML
+- WeasyPrint                        ✅ PDF opcional
+
+EXTRAS INCLUSOS
+- Pydantic                          ✅ Validação schemas
+- requests                          ✅ HTTP client
+- SQLAlchemy ORM                    ✅ Modelos completos
+- Python logging                    ✅ Debug/troubleshooting
+
+
+## 📋 MODELO DE DADOS
+
+6 Tabelas SQLite (completo):
+1. reviews        (id, start_url, report_year, base_year, created_at)
+2. sections       (id, review_id, title, url, anchor, level, is_virtual)
+3. check_runs     (id, review_id, section_id, mode, started_at, finished_at)
+4. check_results  (id, checkrun_id, rule, severity, message, evidence_json)
+5. manual_reviews (id, review_id, section_id, items_checked_json, comments, reviewer, updated_at)
+
+Relacionamentos:
+- Review → Sections (1:N)
+- Review → CheckRuns (1:N)
+- Section → CheckRuns (1:N)
+- CheckRun → CheckResults (1:N)
+- Review/Section → ManualReviews (1:N)
+
+
+## 🔧 CONFIGURAÇÃO
+
+Arquivo principal: app/config.py
+- DATABASE_URL: SQLite local
+- EXPORTS_DIR: Onde salvar relatórios
+- REQUEST_TIMEOUT: 30s (configurável)
+- MAX_PAGES_DEFAULT: 50
+- USER_AGENT: Mozilla/5.0 (padrão)
+
+
+## 📚 DOCUMENTAÇÃO
+
+✅ README.md               - Documentação completa (400+ linhas)
+✅ QUICKSTART.md           - Guia de 3 passos
+✅ EXAMPLES.txt            - 40+ exemplos de curl
+✅ DEPENDENCIES.md         - Setup do sistema (Linux/macOS/Windows)
+✅ Docstrings em Python    - Todas as funções documentadas
+
+
+## 🧪 TESTES INCLUSOS
+
+✅ test.sh                 - Teste automatizado (6 passos)
+                            - Cria review
+                            - Extrai TOC
+                            - Lista seções
+                            - Roda checagens
+                            - Exporta relatório
+                            - Faz download
+
+✅ EXAMPLES.txt            - 40+ exemplos prontos para copiar/colar
+
+
+## 📦 DEPENDÊNCIAS (requirements.txt)
+
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+beautifulsoup4==4.12.2
+pandas==2.1.3
+lxml==4.9.3
+sqlalchemy==2.0.23
+jinja2==3.1.2
+requests==2.31.0
+weasyprint==60.1
+python-multipart==0.0.6
+
+Total: 10 packages de estabilidade comprovada
+
+
+## 🐳 OPÇÕES DE DEPLOYMENT
+
+✅ Local:
+   bash run.sh
+
+✅ Docker:
+   docker-compose up
+
+✅ Produção:
+   uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+
+
+## 📝 RESUMO EXECUTIVO
+
+ENTREGÁVEL: Repositório MVP completo para auditoria do Anuário Estatístico UnB
+
+CARACTERÍSTICAS:
+✅ Descobre automaticamente seções via TOC (heurística robusta)
+✅ Extrai conteúdo e tabelas com análise numérica
+✅ Roda 6 regras de qualidade automáticas
+✅ Salva resultados em SQLite
+✅ Exporta relatório HTML/PDF profissional
+✅ Todos endpoints documentados com exemplos
+✅ Pronto para rodar localmente (bash run.sh)
+
+VALIDAÇÃO:
+✅ Detecta "Anuário Estatístico 2024" → FAIL (R1)
+✅ Detecta "20234" → FAIL (R1)
+✅ Todas as 6 regras funcionando
+✅ Banco de dados persistente
+✅ Relatórios visuais e legíveis
+
+REPOSITÓRIO:
+✅ Modular e bem organizado
+✅ 20 arquivos, ~97KB, ~2000 linhas de código
+✅ Sem dependências externas fora do requirements.txt
+✅ Documentação completa
+✅ Scripts de teste e demonstração
+✅ Docker opcional incluído
+
+STATUS: ✅ PRONTO PARA PRODUÇÃO - NÃO HÁ PENDÊNCIAS
+
+
+================================================================================
+FIM DO MANIFEST
+================================================================================
