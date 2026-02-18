@@ -2,12 +2,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import uuid
+from typing import List, Optional
 import requests
 from bs4 import BeautifulSoup
 import re
-from collections import defaultdict
 
 app = FastAPI(title="Auditoria Anuário UnB")
 
@@ -24,277 +22,240 @@ class AuditRequest(BaseModel):
     report_year: int
     base_year: int
 
-class AuditIssue(BaseModel):
-    severity: str
-    table: str
-    issue: str
-    detail: str
-    recommendation: str
-
-def extract_table_data(table) -> Dict[str, Any]:
-    """Extrai dados estruturados de uma tabela"""
-    rows = table.find_all('tr')
-    data = []
-    headers = []
-    
-    for row_idx, row in enumerate(rows):
-        cells = row.find_all(['td', 'th'])
-        row_data = []
-        
-        for cell in cells:
-            text = cell.get_text(strip=True)
-            row_data.append(text)
-        
-        if row_idx == 0 and all(cell.name == 'th' for cell in cells):
-            headers = row_data
-        else:
-            data.append(row_data)
-    
-    return {
-        "headers": headers,
-        "data": data,
-        "rows": len(data),
-        "cols": len(headers) if headers else (len(data[0]) if data else 0)
-    }
-
-def extract_numbers(text: str) -> List[float]:
-    """Extrai números de um texto"""
-    patterns = [
-        r'\d+\.\d+',  # 1.234
-        r'\d+,\d+',   # 1,234
-        r'\d+',       # 1234
-    ]
-    
-    numbers = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            try:
-                num_str = match.group()
-                # Converter para número
-                num_str = num_str.replace(',', '.')
-                num = float(num_str)
-                if num not in numbers:
-                    numbers.append(num)
-            except:
-                pass
-    
-    return numbers
-
-def run_detailed_audit(html: str, report_year: int, base_year: int) -> List[Dict]:
-    """Faz auditoria detalhada com análise real de tabelas"""
-    issues = []
+def extract_all_table_structures(html: str) -> List[dict]:
+    """Extrai QUALQUER estrutura de tabela - HTML, divs, pre, etc"""
     
     soup = BeautifulSoup(html, 'html.parser')
-    tables = soup.find_all('table')
+    tables = []
     
-    if len(tables) == 0:
-        return [{
-            "severity": "FAIL",
-            "table": "Documento",
-            "issue": "Nenhuma tabela encontrada",
-            "detail": "O documento não contém dados tabulares",
-            "recommendation": "Adicionar tabelas com dados"
-        }]
+    # 1. Tabelas HTML tradicionais
+    for idx, table in enumerate(soup.find_all('table'), 1):
+        rows = []
+        for tr in table.find_all('tr'):
+            cells = []
+            for td in tr.find_all(['td', 'th']):
+                cells.append(td.get_text(strip=True))
+            if cells:
+                rows.append(cells)
+        
+        if rows:
+            tables.append({
+                "type": "HTML_TABLE",
+                "number": idx,
+                "name": f"Tabela {idx}",
+                "rows": rows,
+                "row_count": len(rows),
+                "col_count": len(rows[0]) if rows else 0
+            })
     
-    # Analisar cada tabela
-    for table_idx, table in enumerate(tables, 1):
-        table_name = f"Tabela {table_idx}"
+    # 2. Estruturas em <pre> (dados formatados do R)
+    for idx, pre in enumerate(soup.find_all('pre'), 1):
+        text = pre.get_text()
+        lines = text.strip().split('\n')
         
-        # Tentar pegar título/legenda
-        caption = table.find('caption')
-        if caption:
-            table_name = f"Tabela {table_idx} - {caption.get_text(strip=True)[:50]}"
-        
-        table_data = extract_table_data(table)
-        rows = table_data["data"]
-        cols = table_data["cols"]
-        headers = table_data["headers"]
-        
-        # VERIFICAÇÃO 1: Células vazias e padrão
-        empty_cells = sum(1 for row in rows for cell in row if not cell.strip())
-        total_cells = sum(len(row) for row in rows)
-        
-        if empty_cells > 0:
-            empty_pct = (empty_cells / total_cells * 100) if total_cells > 0 else 0
+        # Se tem múltiplas linhas com números, pode ser tabela
+        if len(lines) > 3:
+            rows = []
+            for line in lines:
+                # Dividir por espaços múltiplos
+                cells = [c.strip() for c in re.split(r'\s{2,}', line.strip()) if c.strip()]
+                if cells:
+                    rows.append(cells)
             
-            if empty_pct > 30:
-                issues.append({
-                    "severity": "FAIL",
-                    "table": table_name,
-                    "issue": f"{empty_pct:.1f}% de células vazias ({empty_cells}/{total_cells})",
-                    "detail": f"Muitas células sem preenchimento. Padrão inconsistente de dados.",
-                    "recommendation": "Preencher células vazias ou padronizar com '0' ou 'N/A'"
+            if len(rows) > 1:
+                tables.append({
+                    "type": "PRE_FORMAT",
+                    "number": idx,
+                    "name": f"Dados formatados {idx} (em <pre>)",
+                    "rows": rows,
+                    "row_count": len(rows),
+                    "col_count": len(rows[0]) if rows else 0
                 })
-            elif empty_pct > 10:
-                issues.append({
-                    "severity": "WARN",
-                    "table": table_name,
-                    "issue": f"{empty_pct:.1f}% de células vazias",
-                    "detail": f"{empty_cells} células sem preenchimento em {total_cells} totais.",
-                    "recommendation": "Verificar se é intencional ou erro de digitação"
-                })
+    
+    # 3. Divs com classe "table" ou "data"
+    for idx, div in enumerate(soup.find_all('div', class_=re.compile(r'table|data', re.I)), 1):
+        text = div.get_text()
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
         
-        # VERIFICAÇÃO 2: Inconsistência de estrutura
-        col_counts = [len(row) for row in rows]
-        if len(set(col_counts)) > 1:
+        if len(lines) > 3:
+            tables.append({
+                "type": "DIV_TABLE",
+                "number": idx,
+                "name": f"Dados em div {idx}",
+                "rows": [[cell for cell in lines]],  # Aproximado
+                "row_count": len(lines),
+                "col_count": 1
+            })
+    
+    # 4. Procurar por blockquote (às vezes usado para tabelas)
+    for idx, bq in enumerate(soup.find_all('blockquote'), 1):
+        text = bq.get_text()
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        
+        if len(lines) > 3:
+            tables.append({
+                "type": "BLOCKQUOTE",
+                "number": idx,
+                "name": f"Bloco de dados {idx}",
+                "rows": [[cell for cell in lines]],
+                "row_count": len(lines),
+                "col_count": 1
+            })
+    
+    return tables
+
+def analyze_table_content(table: dict) -> List[dict]:
+    """Analisa conteúdo de uma tabela para inconsistências"""
+    issues = []
+    rows = table["rows"]
+    table_name = table["name"]
+    
+    if not rows:
+        return issues
+    
+    # 1. Células vazias
+    total_cells = sum(len(row) for row in rows)
+    empty_cells = sum(1 for row in rows for cell in row if not cell or cell.strip() == '')
+    
+    if total_cells > 0:
+        empty_pct = (empty_cells / total_cells * 100)
+        if empty_pct > 20:
             issues.append({
                 "severity": "WARN",
                 "table": table_name,
-                "issue": "Número de colunas inconsistente",
-                "detail": f"Linhas têm {min(col_counts)}-{max(col_counts)} colunas. Padrão: {col_counts}",
-                "recommendation": "Padronizar número de colunas por linha"
+                "issue": f"{empty_pct:.1f}% de células vazias",
+                "detail": f"{empty_cells} de {total_cells} células estão vazias",
+                "recommendation": "Verificar se faltam dados ou se é intencional"
             })
+    
+    # 2. Valores duplicados
+    all_values = []
+    for row in rows:
+        for cell in row:
+            if cell and cell.strip():
+                all_values.append(cell.strip())
+    
+    from collections import Counter
+    value_counts = Counter(all_values)
+    duplicates = {k: v for k, v in value_counts.items() if v > 2 and any(c.isdigit() for c in k)}
+    
+    if duplicates:
+        for val, count in list(duplicates.items())[:3]:
+            issues.append({
+                "severity": "WARN",
+                "table": table_name,
+                "issue": f"Valor '{val}' repetido {count} vezes",
+                "detail": f"Valor aparece {count} vezes em diferentes células",
+                "recommendation": "Verificar se é dado duplicado acidentalmente"
+            })
+    
+    # 3. Linhas duplicadas
+    row_sigs = []
+    for row in rows:
+        sig = tuple(row[:min(3, len(row))])
+        row_sigs.append(sig)
+    
+    sig_counts = Counter(row_sigs)
+    dup_sigs = {k: v for k, v in sig_counts.items() if v > 1}
+    
+    if dup_sigs:
+        for sig, count in list(dup_sigs.items())[:2]:
+            sig_str = ' | '.join(str(s)[:30] for s in sig)
+            issues.append({
+                "severity": "WARN",
+                "table": table_name,
+                "issue": f"Linha duplicada {count} vezes",
+                "detail": f"Padrão: {sig_str}",
+                "recommendation": "Verificar se é duplicação acidental"
+            })
+    
+    # 4. Inconsistência de colunas
+    col_counts = [len(row) for row in rows]
+    if len(set(col_counts)) > 1:
+        issues.append({
+            "severity": "WARN",
+            "table": table_name,
+            "issue": f"Número de colunas inconsistente",
+            "detail": f"Linhas têm {min(col_counts)}-{max(col_counts)} colunas",
+            "recommendation": "Padronizar número de colunas"
+        })
+    
+    # 5. Análise numérica - somas
+    for row_idx, row in enumerate(rows):
+        row_text = ' '.join(row)
         
-        # VERIFICAÇÃO 3: Linhas duplicadas
-        row_signatures = defaultdict(int)
-        for row in rows:
-            sig = tuple(row[:3])  # Usar primeiras 3 colunas como assinatura
-            row_signatures[sig] += 1
-        
-        duplicates = {k: v for k, v in row_signatures.items() if v > 1}
-        if duplicates:
-            for sig, count in list(duplicates.items())[:3]:
-                issues.append({
-                    "severity": "WARN",
-                    "table": table_name,
-                    "issue": f"Linha duplicada {count} vezes",
-                    "detail": f"Padrão: {' | '.join(str(s)[:30] for s in sig)}",
-                    "recommendation": "Verificar se é duplicação acidental"
-                })
-        
-        # VERIFICAÇÃO 4: Análise numérica
-        all_numbers = []
-        for row in rows:
-            for cell in row:
-                nums = extract_numbers(cell)
-                all_numbers.extend(nums)
-        
-        if all_numbers:
-            # Valores muito grandes repetidos
-            from collections import Counter
-            num_counts = Counter(all_numbers)
-            repeated = {k: v for k, v in num_counts.items() if v > 2}
+        if any(x in row_text.lower() for x in ['total', 'soma', 'subtotal']):
+            # Extrair números
+            numbers = [float(re.sub(r'[^\d.]', '', x)) for x in row if re.search(r'\d', x)]
             
-            if repeated:
-                for num, count in list(repeated.items())[:2]:
-                    issues.append({
-                        "severity": "WARN",
-                        "table": table_name,
-                        "issue": f"Valor {num} repetido {count} vezes",
-                        "detail": f"O valor {num} aparece em múltiplas células. Pode indicar dado copiado.",
-                        "recommendation": "Verificar se é valor genuíno ou cópia acidental"
-                    })
-            
-            # Valores suspeitos
-            sorted_nums = sorted(all_numbers)
-            for i in range(len(sorted_nums) - 1):
-                if sorted_nums[i] > 0 and sorted_nums[i+1] > 0:
-                    ratio = sorted_nums[i+1] / sorted_nums[i]
-                    if 0.5 > ratio or ratio > 2:
-                        # Variação grande
-                        pass
-        
-        # VERIFICAÇÃO 5: Totais e somas
-        for row_idx, row in enumerate(rows):
-            row_text = ' '.join(row)
-            
-            # Se parece ser uma linha de "Total"
-            if any(x in row_text.lower() for x in ['total', 'soma', 'subtotal']):
-                # Tentar verificar soma
-                numbers = extract_numbers(row_text)
+            if len(numbers) >= 3:
+                parts = numbers[:-1]
+                total = numbers[-1]
+                calculated = sum(parts)
                 
-                if len(numbers) >= 3:
-                    # Assumir último é o total
-                    parts = numbers[:-1]
-                    total = numbers[-1]
-                    calculated = sum(parts)
-                    
-                    if calculated > 0 and abs(calculated - total) > 0.01:
-                        issues.append({
-                            "severity": "FAIL",
-                            "table": table_name,
-                            "issue": f"Erro de soma na linha {row_idx+1}",
-                            "detail": f"Soma dos valores: {calculated}, mas total registrado: {total}. Diferença: {abs(calculated - total)}",
-                            "recommendation": "Recalcular e verificar a soma"
-                        })
-        
-        # VERIFICAÇÃO 6: Dados faltantes em padrão esperado
-        if len(rows) > 3:
-            # Verificar se primeiro elemento (índice ou ID) está preenchido
-            first_col_filled = sum(1 for row in rows if row and row[0].strip())
-            if first_col_filled < len(rows) * 0.8:
-                issues.append({
-                    "severity": "WARN",
-                    "table": table_name,
-                    "issue": f"Primeira coluna {(1 - first_col_filled/len(rows))*100:.1f}% vazia",
-                    "detail": "Possível falta de identificadores de linha",
-                    "recommendation": "Verificar se é uma coluna de índice/identificação"
-                })
-        
-        # VERIFICAÇÃO 7: Valores negativos suspeitos
-        negative_cells = []
-        for row_idx, row in enumerate(rows):
-            for col_idx, cell in enumerate(row):
-                if '-' in cell and any(c.isdigit() for c in cell):
-                    numbers = extract_numbers(cell)
-                    if any(n < 0 for n in numbers):
-                        negative_cells.append((row_idx, col_idx, cell))
-        
-        if negative_cells:
-            for row_idx, col_idx, cell in negative_cells[:2]:
-                issues.append({
-                    "severity": "WARN",
-                    "table": table_name,
-                    "issue": f"Valor negativo na linha {row_idx+1}, coluna {col_idx+1}",
-                    "detail": f"Valor: {cell}. Verificar se é intencional.",
-                    "recommendation": "Confirmar se valores negativos são esperados nesta tabela"
-                })
+                if calculated > 0 and abs(calculated - total) > 0.01:
+                    issues.append({
+                        "severity": "FAIL",
+                        "table": table_name,
+                        "issue": f"Erro na soma (linha {row_idx+1})",
+                        "detail": f"Soma dos valores: {calculated:.0f}, mas total: {total:.0f}",
+                        "recommendation": "Recalcular a soma"
+                    })
     
-    # VERIFICAÇÕES GLOBAIS
+    return issues
+
+def run_audit(html: str, report_year: int, base_year: int) -> List[dict]:
+    """Auditoria completa adaptada para RMarkdown"""
+    issues = []
     
-    # Verificar ano
+    # Extrair todas as estruturas de tabela
+    tables = extract_all_table_structures(html)
+    
+    if not tables:
+        issues.append({
+            "severity": "INFO",
+            "table": "Documento",
+            "issue": "Analisando estrutura do documento",
+            "detail": f"Documento HTML detectado. Procurando por estruturas de dados...",
+            "recommendation": "Verificar se o documento contém dados tabulares"
+        })
+        return issues
+    
+    # Analisar cada tabela
+    for table in tables:
+        table_issues = analyze_table_content(table)
+        issues.extend(table_issues)
+    
+    # Verificações globais
     year_str = str(report_year)
     if year_str not in html:
         issues.append({
-            "severity": "FAIL",
-            "table": "Documento Geral",
+            "severity": "WARN",
+            "table": "Documento",
             "issue": f"Ano {year_str} não encontrado",
             "detail": "O ano de referência não aparece no documento",
-            "recommendation": f"Incluir ano {year_str} no documento"
+            "recommendation": f"Verificar se {year_str} está presente"
         })
     
-    # Verificar formatação consistente
-    comma_nums = len(re.findall(r'\d{1,3},\d{2,}', html))
-    dot_nums = len(re.findall(r'\d{1,3}\.\d{2,}', html))
-    
-    if comma_nums > 0 and dot_nums > 0:
-        issues.append({
-            "severity": "WARN",
-            "table": "Documento Geral",
-            "issue": "Formatação numérica inconsistente",
-            "detail": f"Documento usa {comma_nums} números com vírgula e {dot_nums} com ponto",
-            "recommendation": "Padronizar separador decimal em todo documento"
-        })
-    
-    # Se não houver problemas, retornar OK
+    # Se não houver issues, retornar OK
     if not issues:
         issues.append({
             "severity": "PASS",
-            "table": "Documento Completo",
-            "issue": "Auditoria concluída - Sem problemas críticos",
-            "detail": "Nenhuma inconsistência foi detectada na auditoria.",
-            "recommendation": "Continuar monitorando atualizações"
+            "table": "Análise Completa",
+            "issue": "Documento validado",
+            "detail": f"Encontradas {len(tables)} estrutura(s) de dados. Sem inconsistências críticas.",
+            "recommendation": "Continuar monitorando"
         })
     
     return issues
 
-# ===== HTML =====
+# ===== HTML INTERFACE =====
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Auditoria Anuário UnB</title>
+    <title>Auditoria UnB</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -307,11 +268,11 @@ HTML = """<!DOCTYPE html>
             background: white;
             border-radius: 12px;
             box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            max-width: 1100px;
+            max-width: 1000px;
             margin: 0 auto;
             padding: 40px;
         }
-        h1 { color: #003366; margin-bottom: 10px; font-size: 28px; }
+        h1 { color: #003366; margin-bottom: 10px; }
         .subtitle { color: #666; margin-bottom: 30px; font-size: 14px; }
         .form-group { margin-bottom: 20px; }
         label { display: block; color: #003366; font-weight: 600; margin-bottom: 8px; }
@@ -328,7 +289,6 @@ HTML = """<!DOCTYPE html>
             cursor: pointer;
             margin-top: 20px;
         }
-        button:hover { transform: translateY(-2px); }
         #loading { display: none; text-align: center; padding: 20px; }
         .spinner {
             border: 4px solid #f3f3f3;
@@ -349,72 +309,29 @@ HTML = """<!DOCTYPE html>
         }
         .stat { text-align: center; padding: 20px; background: #f8f9fa; border-radius: 6px; }
         .stat-number { font-size: 32px; font-weight: bold; color: #003366; }
-        .stat-label { font-size: 12px; color: #666; margin-top: 5px; }
         .issue-item {
             padding: 20px;
             margin-bottom: 15px;
             border-radius: 8px;
             border-left: 5px solid;
         }
-        .issue-item.pass {
-            background: #e8f5e9;
-            border-left-color: #4caf50;
-        }
-        .issue-item.warn {
-            background: #fff3e0;
-            border-left-color: #ff9800;
-        }
-        .issue-item.fail {
-            background: #ffebee;
-            border-left-color: #f44336;
-        }
-        .issue-title {
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .issue-table {
-            color: #666;
-            font-size: 13px;
-            font-weight: 500;
-            margin-bottom: 10px;
-            padding: 5px 10px;
-            background: rgba(0,0,0,0.05);
-            border-radius: 4px;
-            display: inline-block;
-        }
-        .issue-detail {
-            color: #555;
-            font-size: 14px;
-            line-height: 1.6;
-            margin-bottom: 12px;
-        }
-        .issue-recommendation {
-            color: #666;
-            font-size: 13px;
-            font-style: italic;
-            padding: 10px;
-            background: rgba(0,0,0,0.03);
-            border-radius: 4px;
-            border-left: 3px solid;
-        }
-        .issue-item.pass .issue-recommendation { border-left-color: #4caf50; }
-        .issue-item.warn .issue-recommendation { border-left-color: #ff9800; }
-        .issue-item.fail .issue-recommendation { border-left-color: #f44336; }
+        .issue-item.pass { background: #e8f5e9; border-left-color: #4caf50; }
+        .issue-item.warn { background: #fff3e0; border-left-color: #ff9800; }
+        .issue-item.fail { background: #ffebee; border-left-color: #f44336; }
+        .issue-item.info { background: #e3f2fd; border-left-color: #2196f3; }
+        .issue-title { font-weight: 600; color: #333; margin-bottom: 8px; }
+        .issue-table { display: inline-block; background: rgba(0,0,0,0.05); padding: 4px 10px; border-radius: 4px; font-size: 12px; margin-bottom: 10px; }
         .badge { display: inline-block; padding: 4px 12px; border-radius: 4px; font-size: 12px; font-weight: 600; }
         .badge-pass { background: #4caf50; color: white; }
         .badge-warn { background: #ff9800; color: white; }
         .badge-fail { background: #f44336; color: white; }
-        .report-header { color: #003366; margin-bottom: 20px; }
+        .badge-info { background: #2196f3; color: white; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>📋 Auditoria Detalhada - Anuário UnB</h1>
-        <p class="subtitle">Análise completa de inconsistências em tabelas e dados</p>
+        <h1>📋 Auditoria - Anuário UnB</h1>
+        <p class="subtitle">Análise de inconsistências em documentos HTML/RMarkdown</p>
 
         <div id="form">
             <div class="form-group">
@@ -431,17 +348,17 @@ HTML = """<!DOCTYPE html>
                     <input type="number" id="baseYear" value="2024">
                 </div>
             </div>
-            <button onclick="audit()">🔍 Executar Auditoria Completa</button>
+            <button onclick="audit()">🔍 Executar Auditoria</button>
         </div>
 
         <div id="loading">
             <div class="spinner"></div>
-            <p>Analisando documento e tabelas...</p>
+            <p>Analisando documento...</p>
         </div>
 
         <div id="results" class="results">
             <div class="stats" id="stats"></div>
-            <h2 class="report-header">Discrepâncias que merecem atenção:</h2>
+            <h2 style="color: #003366; margin-bottom: 20px;">Relatório de Inconsistências</h2>
             <div id="content"></div>
         </div>
     </div>
@@ -473,7 +390,6 @@ HTML = """<!DOCTYPE html>
 
         function showResults(issues) {
             if (!issues || issues.length === 0) {
-                alert('Sem resultados');
                 document.getElementById('form').style.display = 'block';
                 document.getElementById('loading').style.display = 'none';
                 return;
@@ -482,6 +398,7 @@ HTML = """<!DOCTYPE html>
             const pass = issues.filter(i => i.severity === 'PASS').length;
             const warn = issues.filter(i => i.severity === 'WARN').length;
             const fail = issues.filter(i => i.severity === 'FAIL').length;
+            const info = issues.filter(i => i.severity === 'INFO').length;
 
             document.getElementById('stats').innerHTML = `
                 <div class="stat">
@@ -500,13 +417,15 @@ HTML = """<!DOCTYPE html>
 
             document.getElementById('content').innerHTML = issues.map(i => `
                 <div class="issue-item ${i.severity.toLowerCase()}">
-                    <div class="issue-title">
-                        <span><span class="issue-table">${i.table}</span></span>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                        <span class="issue-table">${i.table}</span>
                         <span class="badge badge-${i.severity.toLowerCase()}">${i.severity}</span>
                     </div>
-                    <div style="color: #333; font-weight: 500; margin-bottom: 8px;">${i.issue}</div>
-                    <div class="issue-detail">${i.detail}</div>
-                    <div class="issue-recommendation">💡 ${i.recommendation}</div>
+                    <div class="issue-title">${i.issue}</div>
+                    <div style="color: #555; font-size: 14px; margin-bottom: 10px;">${i.detail}</div>
+                    <div style="color: #666; font-style: italic; font-size: 13px; padding: 10px; background: rgba(0,0,0,0.03); border-radius: 4px;">
+                        💡 ${i.recommendation}
+                    </div>
                 </div>
             `).join('');
 
@@ -529,7 +448,7 @@ def audit(req: AuditRequest):
         resp = requests.get(req.url, timeout=20)
         html = resp.text
         
-        issues = run_detailed_audit(html, req.report_year, req.base_year)
+        issues = run_audit(html, req.report_year, req.base_year)
         
         return {
             "status": "ok",
