@@ -2,10 +2,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List, Optional
 import requests
 from bs4 import BeautifulSoup
 import re
+from collections import Counter
 
 app = FastAPI(title="Auditoria Anuário UnB")
 
@@ -22,234 +22,274 @@ class AuditRequest(BaseModel):
     report_year: int
     base_year: int
 
-def extract_all_table_structures(html: str) -> List[dict]:
-    """Extrai QUALQUER estrutura de tabela - HTML, divs, pre, etc"""
-    
+def extract_bookdown_tables(html: str) -> list:
+    """Extrai estruturas de tabela do Bookdown (listas, parágrafos com dados)"""
     soup = BeautifulSoup(html, 'html.parser')
+    
     tables = []
     
-    # 1. Tabelas HTML tradicionais
-    for idx, table in enumerate(soup.find_all('table'), 1):
-        rows = []
-        for tr in table.find_all('tr'):
-            cells = []
-            for td in tr.find_all(['td', 'th']):
-                cells.append(td.get_text(strip=True))
-            if cells:
-                rows.append(cells)
-        
-        if rows:
-            tables.append({
-                "type": "HTML_TABLE",
-                "number": idx,
-                "name": f"Tabela {idx}",
-                "rows": rows,
-                "row_count": len(rows),
-                "col_count": len(rows[0]) if rows else 0
-            })
+    # 1. Extrair listas (principais estruturas de dados)
+    ul_lists = soup.find_all('ul', recursive=True)
     
-    # 2. Estruturas em <pre> (dados formatados do R)
-    for idx, pre in enumerate(soup.find_all('pre'), 1):
-        text = pre.get_text()
-        lines = text.strip().split('\n')
+    for ul_idx, ul in enumerate(ul_lists, 1):
+        items = ul.find_all('li', recursive=False)  # Diretos, não nested
         
-        # Se tem múltiplas linhas com números, pode ser tabela
-        if len(lines) > 3:
-            rows = []
-            for line in lines:
-                # Dividir por espaços múltiplos
-                cells = [c.strip() for c in re.split(r'\s{2,}', line.strip()) if c.strip()]
-                if cells:
-                    rows.append(cells)
+        if len(items) > 2:
+            # Verificar se parece ser dados (tem números)
+            list_text = ' '.join([li.get_text() for li in items])
+            if re.search(r'\d+', list_text):
+                table_data = []
+                for li in items:
+                    # Extrair dados do item
+                    text = li.get_text(strip=True)
+                    # Dividir por separadores comuns
+                    cells = re.split(r'[-–—:\s{2,}]', text)
+                    cells = [c.strip() for c in cells if c.strip()]
+                    if cells:
+                        table_data.append(cells)
+                
+                if table_data:
+                    tables.append({
+                        "type": "LISTA",
+                        "number": ul_idx,
+                        "name": f"Lista {ul_idx} (Dados)",
+                        "data": table_data,
+                        "row_count": len(table_data),
+                        "col_count": len(table_data[0]) if table_data else 0
+                    })
+    
+    # 2. Extrair blocos de parágrafos com números
+    paragraphs = soup.find_all('p')
+    
+    para_blocks = []
+    for p in paragraphs:
+        text = p.get_text(strip=True)
+        if re.search(r'\d+', text):
+            para_blocks.append(text)
+    
+    # Agrupar parágrafos consecutivos com dados
+    grouped_blocks = []
+    current_group = []
+    
+    for block in para_blocks:
+        if re.search(r'\d+', block):
+            current_group.append(block)
+        else:
+            if len(current_group) > 2:
+                grouped_blocks.append(current_group)
+            current_group = []
+    
+    if current_group:
+        grouped_blocks.append(current_group)
+    
+    # Processar grupos como pseudo-tabelas
+    for block_idx, group in enumerate(grouped_blocks[:5], 1):  # Limitar a 5
+        if len(group) > 2:
+            table_data = []
+            for line in group:
+                # Tentar extrair números e separadores
+                parts = re.split(r'[-–—:|,]', line)
+                parts = [p.strip() for p in parts if p.strip()]
+                if parts:
+                    table_data.append(parts)
             
-            if len(rows) > 1:
+            if table_data:
                 tables.append({
-                    "type": "PRE_FORMAT",
-                    "number": idx,
-                    "name": f"Dados formatados {idx} (em <pre>)",
-                    "rows": rows,
-                    "row_count": len(rows),
-                    "col_count": len(rows[0]) if rows else 0
+                    "type": "PARAGRAFO",
+                    "number": block_idx,
+                    "name": f"Bloco de Dados {block_idx}",
+                    "data": table_data,
+                    "row_count": len(table_data),
+                    "col_count": max(len(row) for row in table_data) if table_data else 0
                 })
     
-    # 3. Divs com classe "table" ou "data"
-    for idx, div in enumerate(soup.find_all('div', class_=re.compile(r'table|data', re.I)), 1):
-        text = div.get_text()
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
-        
-        if len(lines) > 3:
-            tables.append({
-                "type": "DIV_TABLE",
-                "number": idx,
-                "name": f"Dados em div {idx}",
-                "rows": [[cell for cell in lines]],  # Aproximado
-                "row_count": len(lines),
-                "col_count": 1
-            })
+    # 3. Procurar por seções estruturadas (h2 seguido de conteúdo)
+    h2_sections = soup.find_all('h2')
     
-    # 4. Procurar por blockquote (às vezes usado para tabelas)
-    for idx, bq in enumerate(soup.find_all('blockquote'), 1):
-        text = bq.get_text()
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
+    for h2_idx, h2 in enumerate(h2_sections, 1):
+        # Pegar conteúdo até próximo h2
+        section_text = h2.get_text(strip=True)
         
-        if len(lines) > 3:
-            tables.append({
-                "type": "BLOCKQUOTE",
-                "number": idx,
-                "name": f"Bloco de dados {idx}",
-                "rows": [[cell for cell in lines]],
-                "row_count": len(lines),
-                "col_count": 1
-            })
+        # Procurar por padrão: "nome: valor"
+        next_elem = h2.find_next(['p', 'ul', 'div'])
+        if next_elem:
+            content = next_elem.get_text(strip=True)
+            
+            # Se tem números, pode ser tabela
+            if re.search(r'\d+', content):
+                # Extrair pares chave:valor
+                pairs = re.findall(r'([^:]+):\s*(\d+[.,\d]*)', content)
+                if len(pairs) > 2:
+                    table_data = [list(pair) for pair in pairs]
+                    tables.append({
+                        "type": "SECAO",
+                        "number": h2_idx,
+                        "name": f"Seção: {section_text[:40]}",
+                        "data": table_data,
+                        "row_count": len(table_data),
+                        "col_count": 2
+                    })
     
     return tables
 
-def analyze_table_content(table: dict) -> List[dict]:
-    """Analisa conteúdo de uma tabela para inconsistências"""
+def analyze_bookdown_data(tables: list) -> list:
+    """Analisa dados extraídos do Bookdown"""
     issues = []
-    rows = table["rows"]
-    table_name = table["name"]
-    
-    if not rows:
-        return issues
-    
-    # 1. Células vazias
-    total_cells = sum(len(row) for row in rows)
-    empty_cells = sum(1 for row in rows for cell in row if not cell or cell.strip() == '')
-    
-    if total_cells > 0:
-        empty_pct = (empty_cells / total_cells * 100)
-        if empty_pct > 20:
-            issues.append({
-                "severity": "WARN",
-                "table": table_name,
-                "issue": f"{empty_pct:.1f}% de células vazias",
-                "detail": f"{empty_cells} de {total_cells} células estão vazias",
-                "recommendation": "Verificar se faltam dados ou se é intencional"
-            })
-    
-    # 2. Valores duplicados
-    all_values = []
-    for row in rows:
-        for cell in row:
-            if cell and cell.strip():
-                all_values.append(cell.strip())
-    
-    from collections import Counter
-    value_counts = Counter(all_values)
-    duplicates = {k: v for k, v in value_counts.items() if v > 2 and any(c.isdigit() for c in k)}
-    
-    if duplicates:
-        for val, count in list(duplicates.items())[:3]:
-            issues.append({
-                "severity": "WARN",
-                "table": table_name,
-                "issue": f"Valor '{val}' repetido {count} vezes",
-                "detail": f"Valor aparece {count} vezes em diferentes células",
-                "recommendation": "Verificar se é dado duplicado acidentalmente"
-            })
-    
-    # 3. Linhas duplicadas
-    row_sigs = []
-    for row in rows:
-        sig = tuple(row[:min(3, len(row))])
-        row_sigs.append(sig)
-    
-    sig_counts = Counter(row_sigs)
-    dup_sigs = {k: v for k, v in sig_counts.items() if v > 1}
-    
-    if dup_sigs:
-        for sig, count in list(dup_sigs.items())[:2]:
-            sig_str = ' | '.join(str(s)[:30] for s in sig)
-            issues.append({
-                "severity": "WARN",
-                "table": table_name,
-                "issue": f"Linha duplicada {count} vezes",
-                "detail": f"Padrão: {sig_str}",
-                "recommendation": "Verificar se é duplicação acidental"
-            })
-    
-    # 4. Inconsistência de colunas
-    col_counts = [len(row) for row in rows]
-    if len(set(col_counts)) > 1:
-        issues.append({
-            "severity": "WARN",
-            "table": table_name,
-            "issue": f"Número de colunas inconsistente",
-            "detail": f"Linhas têm {min(col_counts)}-{max(col_counts)} colunas",
-            "recommendation": "Padronizar número de colunas"
-        })
-    
-    # 5. Análise numérica - somas
-    for row_idx, row in enumerate(rows):
-        row_text = ' '.join(row)
-        
-        if any(x in row_text.lower() for x in ['total', 'soma', 'subtotal']):
-            # Extrair números
-            numbers = [float(re.sub(r'[^\d.]', '', x)) for x in row if re.search(r'\d', x)]
-            
-            if len(numbers) >= 3:
-                parts = numbers[:-1]
-                total = numbers[-1]
-                calculated = sum(parts)
-                
-                if calculated > 0 and abs(calculated - total) > 0.01:
-                    issues.append({
-                        "severity": "FAIL",
-                        "table": table_name,
-                        "issue": f"Erro na soma (linha {row_idx+1})",
-                        "detail": f"Soma dos valores: {calculated:.0f}, mas total: {total:.0f}",
-                        "recommendation": "Recalcular a soma"
-                    })
-    
-    return issues
-
-def run_audit(html: str, report_year: int, base_year: int) -> List[dict]:
-    """Auditoria completa adaptada para RMarkdown"""
-    issues = []
-    
-    # Extrair todas as estruturas de tabela
-    tables = extract_all_table_structures(html)
     
     if not tables:
         issues.append({
             "severity": "INFO",
             "table": "Documento",
-            "issue": "Analisando estrutura do documento",
-            "detail": f"Documento HTML detectado. Procurando por estruturas de dados...",
-            "recommendation": "Verificar se o documento contém dados tabulares"
+            "issue": "Estrutura Bookdown detectada",
+            "detail": "Documento é um Bookdown/GitBook. Estrutura: listas, parágrafos e seções com dados formatados.",
+            "recommendation": "Analisando estruturas de dados formatadas..."
         })
         return issues
     
     # Analisar cada tabela
     for table in tables:
-        table_issues = analyze_table_content(table)
-        issues.extend(table_issues)
+        data = table["data"]
+        table_name = table["name"]
+        
+        # 1. Verificar células vazias
+        total_cells = sum(len(row) for row in data)
+        empty_cells = sum(1 for row in data for cell in row if not cell or not cell.strip())
+        
+        if total_cells > 0:
+            empty_pct = (empty_cells / total_cells * 100)
+            if empty_pct > 20:
+                issues.append({
+                    "severity": "WARN",
+                    "table": table_name,
+                    "issue": f"{empty_pct:.1f}% de células vazias",
+                    "detail": f"{empty_cells} de {total_cells} células",
+                    "recommendation": "Verificar dados faltantes"
+                })
+        
+        # 2. Valores duplicados
+        all_values = []
+        for row in data:
+            for cell in row:
+                if cell and cell.strip() and any(c.isdigit() for c in cell):
+                    all_values.append(cell.strip())
+        
+        if all_values:
+            value_counts = Counter(all_values)
+            dups = {k: v for k, v in value_counts.items() if v > 2}
+            
+            if dups:
+                for val, count in list(dups.items())[:2]:
+                    issues.append({
+                        "severity": "WARN",
+                        "table": table_name,
+                        "issue": f"Valor '{val}' repetido {count} vezes",
+                        "detail": f"Valor aparece múltiplas vezes",
+                        "recommendation": "Verificar se é cópia ou dado genuíno"
+                    })
+        
+        # 3. Inconsistência de estrutura
+        col_counts = [len(row) for row in data]
+        if len(set(col_counts)) > 1:
+            issues.append({
+                "severity": "WARN",
+                "table": table_name,
+                "issue": f"Estrutura inconsistente",
+                "detail": f"Linhas têm {min(col_counts)}-{max(col_counts)} colunas",
+                "recommendation": "Padronizar número de colunas"
+            })
+        
+        # 4. Procurar por valores suspeitos
+        for row_idx, row in enumerate(data):
+            row_text = ' '.join(row)
+            
+            # Verificar se parece ser um total
+            if any(x in row_text.lower() for x in ['total', 'soma', 'subtotal']):
+                numbers = []
+                for cell in row:
+                    # Extrair números
+                    nums = re.findall(r'\d+(?:[.,]\d+)?', cell)
+                    for n in nums:
+                        try:
+                            num = float(n.replace(',', '.'))
+                            numbers.append(num)
+                        except:
+                            pass
+                
+                if len(numbers) >= 3:
+                    parts = numbers[:-1]
+                    total = numbers[-1]
+                    calculated = sum(parts)
+                    
+                    if calculated > 0 and abs(calculated - total) > 0.01:
+                        issues.append({
+                            "severity": "FAIL",
+                            "table": table_name,
+                            "issue": f"Erro na soma (linha {row_idx+1})",
+                            "detail": f"Soma esperada: {calculated:.0f}, mas registrado: {total:.0f}",
+                            "recommendation": "Recalcular totais"
+                        })
+    
+    return issues
+
+def run_bookdown_audit(html: str, report_year: int, base_year: int) -> list:
+    """Auditoria completa para Bookdown"""
+    issues = []
+    
+    # Extrair estruturas
+    tables = extract_bookdown_tables(html)
+    
+    # Analisar
+    data_issues = analyze_bookdown_data(tables)
+    issues.extend(data_issues)
     
     # Verificações globais
     year_str = str(report_year)
-    if year_str not in html:
-        issues.append({
-            "severity": "WARN",
-            "table": "Documento",
-            "issue": f"Ano {year_str} não encontrado",
-            "detail": "O ano de referência não aparece no documento",
-            "recommendation": f"Verificar se {year_str} está presente"
-        })
-    
-    # Se não houver issues, retornar OK
-    if not issues:
+    if year_str in html:
+        count = html.count(year_str)
         issues.append({
             "severity": "PASS",
-            "table": "Análise Completa",
-            "issue": "Documento validado",
-            "detail": f"Encontradas {len(tables)} estrutura(s) de dados. Sem inconsistências críticas.",
-            "recommendation": "Continuar monitorando"
+            "table": "Metadados",
+            "issue": f"Ano {year_str} presente",
+            "detail": f"Ano aparece {count} vez(es) no documento",
+            "recommendation": "OK"
+        })
+    else:
+        issues.append({
+            "severity": "WARN",
+            "table": "Metadados",
+            "issue": f"Ano {year_str} não encontrado",
+            "detail": "Referência ao ano não foi localizada",
+            "recommendation": f"Adicionar ano {year_str}"
+        })
+    
+    # Formatação
+    soup = BeautifulSoup(html, 'html.parser')
+    text = soup.get_text()
+    
+    comma_nums = len(re.findall(r'\d{1,3},\d{2,}', text))
+    dot_nums = len(re.findall(r'\d{1,3}\.\d{2,}', text))
+    
+    if comma_nums > 0 and dot_nums > 0:
+        issues.append({
+            "severity": "WARN",
+            "table": "Formatação",
+            "issue": "Mistura de separadores decimais",
+            "detail": f"{comma_nums} com vírgula, {dot_nums} com ponto",
+            "recommendation": "Padronizar separador decimal"
+        })
+    
+    # Se não houver problemas, adicionar confirmação
+    if len([i for i in issues if i["severity"] in ["FAIL", "WARN"]]) == 0:
+        issues.append({
+            "severity": "PASS",
+            "table": "Análise",
+            "issue": "Auditoria concluída com sucesso",
+            "detail": f"Analisadas {len(tables)} estrutura(s) de dados. Nenhum problema crítico detectado.",
+            "recommendation": "Documento está adequado"
         })
     
     return issues
 
-# ===== HTML INTERFACE =====
 HTML = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -319,19 +359,17 @@ HTML = """<!DOCTYPE html>
         .issue-item.warn { background: #fff3e0; border-left-color: #ff9800; }
         .issue-item.fail { background: #ffebee; border-left-color: #f44336; }
         .issue-item.info { background: #e3f2fd; border-left-color: #2196f3; }
-        .issue-title { font-weight: 600; color: #333; margin-bottom: 8px; }
-        .issue-table { display: inline-block; background: rgba(0,0,0,0.05); padding: 4px 10px; border-radius: 4px; font-size: 12px; margin-bottom: 10px; }
-        .badge { display: inline-block; padding: 4px 12px; border-radius: 4px; font-size: 12px; font-weight: 600; }
-        .badge-pass { background: #4caf50; color: white; }
-        .badge-warn { background: #ff9800; color: white; }
-        .badge-fail { background: #f44336; color: white; }
-        .badge-info { background: #2196f3; color: white; }
+        .badge { display: inline-block; padding: 4px 12px; border-radius: 4px; font-size: 12px; font-weight: 600; color: white; }
+        .badge-pass { background: #4caf50; }
+        .badge-warn { background: #ff9800; }
+        .badge-fail { background: #f44336; }
+        .badge-info { background: #2196f3; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>📋 Auditoria - Anuário UnB</h1>
-        <p class="subtitle">Análise de inconsistências em documentos HTML/RMarkdown</p>
+        <p class="subtitle">Análise de Bookdown/GitBook - Detecção de inconsistências</p>
 
         <div id="form">
             <div class="form-group">
@@ -353,12 +391,12 @@ HTML = """<!DOCTYPE html>
 
         <div id="loading">
             <div class="spinner"></div>
-            <p>Analisando documento...</p>
+            <p>Analisando Bookdown...</p>
         </div>
 
         <div id="results" class="results">
             <div class="stats" id="stats"></div>
-            <h2 style="color: #003366; margin-bottom: 20px;">Relatório de Inconsistências</h2>
+            <h2 style="color: #003366; margin-bottom: 20px;">Inconsistências Detectadas</h2>
             <div id="content"></div>
         </div>
     </div>
@@ -398,7 +436,6 @@ HTML = """<!DOCTYPE html>
             const pass = issues.filter(i => i.severity === 'PASS').length;
             const warn = issues.filter(i => i.severity === 'WARN').length;
             const fail = issues.filter(i => i.severity === 'FAIL').length;
-            const info = issues.filter(i => i.severity === 'INFO').length;
 
             document.getElementById('stats').innerHTML = `
                 <div class="stat">
@@ -418,10 +455,10 @@ HTML = """<!DOCTYPE html>
             document.getElementById('content').innerHTML = issues.map(i => `
                 <div class="issue-item ${i.severity.toLowerCase()}">
                     <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
-                        <span class="issue-table">${i.table}</span>
+                        <strong>${i.table}</strong>
                         <span class="badge badge-${i.severity.toLowerCase()}">${i.severity}</span>
                     </div>
-                    <div class="issue-title">${i.issue}</div>
+                    <div style="color: #333; font-weight: 500; margin-bottom: 8px;">${i.issue}</div>
                     <div style="color: #555; font-size: 14px; margin-bottom: 10px;">${i.detail}</div>
                     <div style="color: #666; font-style: italic; font-size: 13px; padding: 10px; background: rgba(0,0,0,0.03); border-radius: 4px;">
                         💡 ${i.recommendation}
@@ -436,8 +473,6 @@ HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# ===== ENDPOINTS =====
-
 @app.get("/", response_class=HTMLResponse)
 def serve():
     return HTML
@@ -448,7 +483,7 @@ def audit(req: AuditRequest):
         resp = requests.get(req.url, timeout=20)
         html = resp.text
         
-        issues = run_audit(html, req.report_year, req.base_year)
+        issues = run_bookdown_audit(html, req.report_year, req.base_year)
         
         return {
             "status": "ok",
