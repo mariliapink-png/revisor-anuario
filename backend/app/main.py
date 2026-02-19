@@ -33,7 +33,7 @@ def extract_html_tables(html: str) -> list:
         table_name = f"Tabela {table_idx}"
         if caption:
             caption_text = caption.get_text(strip=True)
-            table_name = caption_text[:100]  # Primeiros 100 caracteres
+            table_name = caption_text[:100]
         
         # Extrair headers
         headers = []
@@ -117,16 +117,16 @@ def analyze_table_quality(table: dict) -> list:
     
     if all_values:
         value_counts = Counter(all_values)
-        suspicious = {k: v for k, v in value_counts.items() if v >= 2 and any(c.isdigit() for c in k) and len(k) > 1}
+        suspicious = {k: v for k, v in value_counts.items() if v >= 3 and any(c.isdigit() for c in k) and len(k) > 2}
         
         if suspicious:
-            for val, count in list(suspicious.items())[:3]:
+            for val, count in list(suspicious.items())[:2]:
                 issues.append({
                     "severity": "WARN",
                     "table": table_name,
                     "issue": f"Valor duplicado: '{val}' aparece {count} vezes",
-                    "detail": f"Valor numérico/alfanumérico repetido {count} vezes. Estatisticamente improvável.",
-                    "recommendation": "Verificar se é cópia acidental ou dado genuíno"
+                    "detail": f"Valor numérico/alfanumérico repetido {count} vezes em diferentes linhas. Pode indicar cópia acidental.",
+                    "recommendation": "Verificar se é dado genuíno ou cópia"
                 })
     
     # 4. VERIFICAÇÃO: Linhas completamente duplicadas
@@ -153,7 +153,6 @@ def analyze_table_quality(table: dict) -> list:
             # Tentar extrair números
             numbers = []
             for cell in row:
-                # Extrair números (suporta vírgula e ponto como separador decimal)
                 matches = re.findall(r'\d+(?:[.,]\d+)?', cell)
                 for match in matches:
                     try:
@@ -162,8 +161,9 @@ def analyze_table_quality(table: dict) -> list:
                     except:
                         pass
             
-            # Se tem pelo menos 3 números, último é provavelmente o total
+            # Se tem pelo menos 3 números, tentar validar soma
             if len(numbers) >= 3:
+                # Assumir padrão: A + B = Total ou A + B + C = Total
                 parts = numbers[:-1]
                 total = numbers[-1]
                 calculated = sum(parts)
@@ -172,60 +172,68 @@ def analyze_table_quality(table: dict) -> list:
                     diff = abs(calculated - total)
                     diff_pct = (diff / calculated * 100) if calculated > 0 else 0
                     
-                    if diff_pct > 0.1:  # Diferença maior que 0.1%
+                    if diff_pct > 0.1:
                         issues.append({
                             "severity": "FAIL",
                             "table": table_name,
                             "issue": f"Erro na soma (linha {row_idx+1})",
-                            "detail": f"Soma dos valores: {calculated:.2f}, mas total registrado: {total:.2f}. Diferença: {diff:.2f}",
+                            "detail": f"Soma dos parciais: {calculated:.2f}, mas total: {total:.2f}. Diferença: {diff:.2f}",
                             "recommendation": "Recalcular e corrigir o total"
                         })
     
-    # 6. VERIFICAÇÃO: Valores extremos ou suspeitos
+    # 6. VERIFICAÇÃO: Valores extremos ou suspeitos (apenas zeros à esquerda óbvios)
     for row_idx, row in enumerate(rows):
         for col_idx, cell in enumerate(row):
-            # Verificar zeros à esquerda (00000, 000)
-            if re.match(r'^0{2,}', cell) and len(cell) > 2:
+            # Verificar zeros à esquerda anormais (00000)
+            if re.match(r'^0{3,}', cell) and len(cell) > 3:
                 issues.append({
                     "severity": "WARN",
                     "table": table_name,
-                    "issue": f"Valor com zeros à esquerda: '{cell}'",
-                    "detail": f"Linha {row_idx+1}, coluna {col_idx+1}: '{cell}' pode ser placeholder",
+                    "issue": f"Valor com múltiplos zeros: '{cell}'",
+                    "detail": f"Linha {row_idx+1}, coluna {col_idx+1}: '{cell}' pode ser placeholder ou erro",
                     "recommendation": "Verificar se é valor real ou placeholder"
                 })
-                break  # Uma por tabela é suficiente
+                break
     
-    # 7. VERIFICAÇÃO: Mudanças drasticamente anormais em séries
-    if len(rows) > 2:
-        # Procurar por colunas numéricas
-        numeric_cols = []
-        for col_idx in range(len(rows[0])):
+    # 7. VERIFICAÇÃO: Variações anormais APENAS em série temporal real
+    # (não comparar colunas de contextos diferentes como totais)
+    if len(rows) > 3 and len(rows[0]) >= 3:
+        # Procurar apenas em colunas que parecem ser mesma unidade
+        # Ignorar a primeira coluna (nomes) e última (pode ser total)
+        for col_start in range(1, len(rows[0]) - 2):
+            # Pegar 2-3 colunas consecutivas (possível série temporal)
             numbers = []
-            for row in rows:
-                if col_idx < len(row):
-                    match = re.findall(r'\d+(?:[.,]\d+)?', row[col_idx])
-                    if match:
+            row_idx_with_nums = []
+            
+            for row_idx, row in enumerate(rows):
+                cell_value = None
+                if col_start < len(row):
+                    matches = re.findall(r'\d+(?:[.,]\d+)?', row[col_start])
+                    if matches:
                         try:
-                            numbers.append(float(match[0].replace(',', '.')))
+                            cell_value = float(matches[0].replace(',', '.'))
                         except:
                             pass
-            if len(numbers) > 2:
-                numeric_cols.append((col_idx, numbers))
-        
-        # Verificar variações anormais
-        for col_idx, numbers in numeric_cols:
-            for i in range(len(numbers) - 1):
-                if numbers[i] > 0 and numbers[i+1] > 0:
-                    ratio = numbers[i+1] / numbers[i]
-                    if ratio < 0.1 or ratio > 10:  # Variação maior que 10x ou queda de 90%
-                        issues.append({
-                            "severity": "WARN",
-                            "table": table_name,
-                            "issue": f"Variação anormal em coluna",
-                            "detail": f"Valor muda de {numbers[i]:.0f} para {numbers[i+1]:.0f} (variação de {ratio:.1f}x). Típico de queda de 92% ou aumento de 10x.",
-                            "recommendation": "Verificar se mudança é real ou erro de digitação"
-                        })
-                        break  # Uma por tabela
+                
+                if cell_value is not None and cell_value > 0:
+                    numbers.append(cell_value)
+                    row_idx_with_nums.append(row_idx)
+            
+            # Verificar variações apenas em séries com mais de 5 pontos
+            if len(numbers) > 5:
+                for i in range(len(numbers) - 1):
+                    if numbers[i] > 0 and numbers[i+1] > 0:
+                        ratio = numbers[i+1] / numbers[i]
+                        # Só reportar variações MUITO extremas (acima de 20x ou queda de 95%)
+                        if ratio < 0.05 or ratio > 20:
+                            issues.append({
+                                "severity": "WARN",
+                                "table": table_name,
+                                "issue": f"Variação extrema detectada",
+                                "detail": f"Valor muda de {numbers[i]:.0f} para {numbers[i+1]:.0f} (variação de {ratio:.1f}x em linhas consecutivas). Verificar se é real ou erro.",
+                                "recommendation": "Confirmar dados da série"
+                            })
+                            break
     
     # 8. VERIFICAÇÃO: Falta de fonte
     if not table["source"] or "Fonte" not in table["source"]:
@@ -233,7 +241,7 @@ def analyze_table_quality(table: dict) -> list:
             "severity": "WARN",
             "table": table_name,
             "issue": "Fonte não identificada",
-            "detail": "Tabela não possui referência de origem dos dados",
+            "detail": "Tabela não possui referência clara de origem dos dados",
             "recommendation": "Adicionar identificação da fonte dos dados"
         })
     
