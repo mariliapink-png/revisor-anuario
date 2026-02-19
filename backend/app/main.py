@@ -1,6 +1,35 @@
 import re
 from typing import List, Dict, Tuple, Optional, Any
+from datetime import datetime
+
+import requests
 from bs4 import BeautifulSoup
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
+
+
+# =========================
+# FastAPI app (OBRIGATÓRIO p/ Render: uvicorn app.main:app)
+# =========================
+
+app = FastAPI(title="Auditoria Anuário UnB")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class AuditRequest(BaseModel):
+    url: str
+    report_year: int
+    base_year: int
+
 
 # =========================
 # Normalização / parsing
@@ -21,35 +50,30 @@ def parse_number_ptbr(s: str) -> Optional[Any]:
         return None
     s = normalize_text(s)
 
-    # Remove marcadores comuns (ex.: notas)
+    # Remove marcadores comuns (ex.: % no final)
     s = re.sub(r'[%]$', '', s).strip()
 
-    # 1.234.567
     if re.match(r'^\d{1,3}(\.\d{3})+$', s):
         return int(s.replace('.', ''))
 
-    # 1.234,56
     if re.match(r'^\d{1,3}(\.\d{3})*,\d+$', s):
         try:
             return float(s.replace('.', '').replace(',', '.'))
         except:
             return None
 
-    # 1234,56 (sem milhar)
     if re.match(r'^\d+,\d+$', s):
         try:
             return float(s.replace(',', '.'))
         except:
             return None
 
-    # 1234.56 (padrão EN - geralmente indesejado)
     if re.match(r'^\d+\.\d+$', s):
         try:
             return float(s)
         except:
             return None
 
-    # 1234
     if re.match(r'^\d+$', s):
         try:
             return int(s)
@@ -57,6 +81,33 @@ def parse_number_ptbr(s: str) -> Optional[Any]:
             return None
 
     return None
+
+
+# =========================
+# Download HTML
+# =========================
+
+def download_page(url: str) -> Tuple[str, Dict]:
+    """Baixa HTML com headers realistas"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9",
+    }
+    try:
+        resp = requests.get(url, timeout=25, headers=headers)
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
+        tables = soup.find_all("table")
+        return html, {
+            "tamanho_html_kb": len(html) / 1024,
+            "contagem_tables": len(tables),
+            "status": "OK",
+        }
+    except Exception as e:
+        return "", {"tamanho_html_kb": 0, "contagem_tables": 0, "status": f"ERRO: {str(e)}"}
 
 
 # =========================
@@ -69,40 +120,33 @@ def extract_tables_from_html(html: str) -> List[Dict]:
 
     all_tables = soup.find_all("table")
     for table_idx, table_elem in enumerate(all_tables, 1):
-        # Nome: caption ou aria-label ou id
         caption = table_elem.find("caption")
         table_name = normalize_text(caption.get_text(" ", strip=True)) if caption else ""
         if not table_name:
             table_name = normalize_text(table_elem.get("aria-label", "")) or f"Tabela {table_idx}"
 
-        # Headers
         headers = []
         thead = table_elem.find("thead")
         if thead:
             headers = [normalize_text(th.get_text(" ", strip=True)) for th in thead.find_all("th")]
         else:
-            # fallback: primeira linha com <th>
             first_tr = table_elem.find("tr")
             if first_tr:
                 ths = first_tr.find_all("th")
                 if ths:
                     headers = [normalize_text(th.get_text(" ", strip=True)) for th in ths]
 
-        # Rows
         rows_raw = []
         tbody = table_elem.find("tbody") or table_elem
         for tr in tbody.find_all("tr"):
             tds = tr.find_all(["td", "th"])
             cells = [normalize_text(td.get_text(" ", strip=True)) for td in tds]
-            # descarta linha vazia
             if any(c != "" for c in cells):
                 rows_raw.append(cells)
 
-        # Contexto ao redor (ajuda a detectar Fonte fora da tabela)
         around_text = []
-        # pega próximos irmãos (até 5) depois da tabela
         sib = table_elem
-        for _ in range(5):
+        for _ in range(7):  # aumentei um pouco o alcance
             sib = sib.find_next_sibling()
             if not sib:
                 break
@@ -116,7 +160,7 @@ def extract_tables_from_html(html: str) -> List[Dict]:
             "headers": headers,
             "rows_raw": rows_raw,
             "html": str(table_elem),
-            "around_text": around_text,   # <- importante
+            "around_text": around_text,
         })
 
     return tables
@@ -137,8 +181,8 @@ def detect_year_columns(headers: List[str]) -> List[int]:
 def has_time_series_indicator(table_name: str) -> bool:
     t = normalize_text(table_name).lower()
     indicators = [
-        'série', 'evolução', 'históric', 'trend', 'período', 'temporal',
-        r'20\d{2}\s+a\s+20\d{2}', r'20\d{2}\s*-\s*20\d{2}'
+        "série", "evolução", "históric", "trend", "período", "temporal",
+        r"20\d{2}\s+a\s+20\d{2}", r"20\d{2}\s*-\s*20\d{2}"
     ]
     return any(re.search(p, t) for p in indicators)
 
@@ -147,17 +191,17 @@ def find_source_text(table: Dict) -> Optional[str]:
     Encontra 'Fonte:' dentro do HTML da tabela OU no texto logo abaixo (around_text),
     incluindo casos em itálico (<i>/<em>).
     """
-    # 1) dentro do HTML da própria tabela
     html = table.get("html", "")
     soup = BeautifulSoup(html, "html.parser")
     inside_txt = normalize_text(soup.get_text(" ", strip=True))
-    m = re.search(r'\bFonte\s*:\s*(.+)$', inside_txt, flags=re.IGNORECASE)
+
+    # NÃO use $ no fim: muitas vezes "Fonte:" não está no final da string extraída
+    m = re.search(r"\bFonte\s*:\s*([^\n\r]+)", inside_txt, flags=re.IGNORECASE)
     if m:
         return normalize_text("Fonte: " + m.group(1))
 
-    # 2) logo após a tabela (rodapé)
     for block in table.get("around_text", []):
-        m2 = re.search(r'\bFonte\s*:\s*(.+)', block, flags=re.IGNORECASE)
+        m2 = re.search(r"\bFonte\s*:\s*([^\n\r]+)", block, flags=re.IGNORECASE)
         if m2:
             return normalize_text("Fonte: " + m2.group(1))
 
@@ -165,12 +209,11 @@ def find_source_text(table: Dict) -> Optional[str]:
 
 
 # =========================
-# Regras novas (cobrindo o seu checklist)
+# Regras
 # =========================
 
 def rule_missing_source(table: Dict) -> Optional[Dict]:
-    src = find_source_text(table)
-    if not src:
+    if not find_source_text(table):
         return {
             "severity": "FAIL",
             "table": table["nome"],
@@ -206,17 +249,10 @@ def rule_blank_cells(table: Dict) -> Optional[Dict]:
     return None
 
 def rule_year_base_mismatch(table: Dict, base_year: int) -> Optional[Dict]:
-    """
-    Ano-base é 2024: alerta se aparecerem anos fora do esperado no título/cabeçalho/linhas.
-    Não impede séries históricas (ex.: 2020–2024), mas pega casos tipo 2023 perdido no título.
-    """
     name = normalize_text(table.get("nome", ""))
     headers = [normalize_text(h) for h in table.get("headers", [])]
-    # Busca anos explícitos
-    years_in_name = set(re.findall(r'\b(20\d{2})\b', name))
-    years_in_headers = set(re.findall(r'\b(20\d{2})\b', " ".join(headers)))
-
-    # Aceita séries que incluam base_year; problema é quando NÃO inclui base_year e aparece outro ano "solto"
+    years_in_name = set(re.findall(r"\b(20\d{2})\b", name))
+    years_in_headers = set(re.findall(r"\b(20\d{2})\b", " ".join(headers)))
     all_years = years_in_name.union(years_in_headers)
     if not all_years:
         return None
@@ -226,23 +262,10 @@ def rule_year_base_mismatch(table: Dict, base_year: int) -> Optional[Dict]:
             "severity": "FAIL",
             "table": table["nome"],
             "rule": "year_base_mismatch",
-            "issue": "Ano-base (2024) não aparece na tabela",
+            "issue": f"Ano-base ({base_year}) não aparece na tabela",
             "detail": f"Anos detectados: {', '.join(sorted(all_years))}",
-            "recommendation": "Revisar título/cabeçalho/legendas para refletir o ano-base 2024 (ou série histórica incluindo 2024)."
+            "recommendation": f"Revisar título/cabeçalho/legendas para refletir o ano-base {base_year}."
         }
-
-    # Se tem 2023 e 2024, ok (série). Mas se o nome tiver "..., 2023" e a tabela é 2024, isso precisa de regra mais contextual.
-    # Mantemos como WARN quando houver 2023 no título junto de 2024 (possível resíduo)
-    if "2023" in years_in_name and str(base_year) in years_in_name and not has_time_series_indicator(name):
-        return {
-            "severity": "WARN",
-            "table": table["nome"],
-            "rule": "year_possible_residue",
-            "issue": "Possível resíduo de ano no título",
-            "detail": f"Título contém 2023 e {base_year} mas não parece série histórica.",
-            "recommendation": "Confirmar se o título/legenda foi atualizado corretamente para o ano-base 2024."
-        }
-
     return None
 
 def rule_thousand_separator_inconsistency(table: Dict) -> Optional[Dict]:
@@ -258,20 +281,18 @@ def rule_thousand_separator_inconsistency(table: Dict) -> Optional[Dict]:
             c = normalize_text(cell)
             if not c:
                 continue
-            # Contar padrões só para células "numéricas aparentes"
-            if re.match(r'^\d{1,3}(\.\d{3})+$', c):
+            if re.match(r"^\d{1,3}(\.\d{3})+$", c):
                 patterns["pt_milhar"] += 1; sample += 1
-            elif re.match(r'^\d{1,3}(\.\d{3})*,\d+$', c) or re.match(r'^\d+,\d+$', c):
+            elif re.match(r"^\d{1,3}(\.\d{3})*,\d+$", c) or re.match(r"^\d+,\d+$", c):
                 patterns["pt_decimal"] += 1; sample += 1
-            elif re.match(r'^\d+\.\d+$', c):
+            elif re.match(r"^\d+\.\d+$", c):
                 patterns["en_decimal"] += 1; sample += 1
-            elif re.match(r'^\d+$', c):
+            elif re.match(r"^\d+$", c):
                 patterns["plain_int"] += 1; sample += 1
 
     if sample < 5:
         return None
 
-    # mistura perigosa: en_decimal junto com pt_decimal
     if patterns["en_decimal"] > 0 and patterns["pt_decimal"] > 0:
         return {
             "severity": "FAIL",
@@ -282,7 +303,6 @@ def rule_thousand_separator_inconsistency(table: Dict) -> Optional[Dict]:
             "recommendation": "Padronizar decimais em PT-BR: usar vírgula para decimal (ex.: 1,23)."
         }
 
-    # mistura: milhar com e sem ponto (ex.: 1.234 e 1234)
     if patterns["pt_milhar"] > 0 and patterns["plain_int"] > 0:
         return {
             "severity": "WARN",
@@ -296,27 +316,21 @@ def rule_thousand_separator_inconsistency(table: Dict) -> Optional[Dict]:
     return None
 
 def rule_totals_divergence(table: Dict) -> Optional[Dict]:
-    """
-    Procura linha de TOTAL e compara com soma das linhas acima (por coluna numérica).
-    Só aplica quando há pelo menos 3 linhas e pelo menos 2 colunas numéricas.
-    """
     rows = table.get("rows_raw", [])
     if not rows or len(rows) < 3:
         return None
 
-    # detectar índice da linha TOTAL
     total_idx = None
     for i, row in enumerate(rows):
-        if row and re.match(r'^(total|TOTAL)\b', normalize_text(row[0]), flags=re.IGNORECASE):
+        if row and re.match(r"^(total)\b", normalize_text(row[0]), flags=re.IGNORECASE):
             total_idx = i
             break
     if total_idx is None:
         return None
 
-    # converter para matriz numérica por coluna
     n_cols = max(len(r) for r in rows)
     numeric_cols = []
-    for c in range(1, n_cols):  # ignora coluna 0 (rótulo)
+    for c in range(1, n_cols):
         nums = []
         for r in rows[:total_idx]:
             if c < len(r):
@@ -326,10 +340,9 @@ def rule_totals_divergence(table: Dict) -> Optional[Dict]:
         if len(nums) >= 2:
             numeric_cols.append(c)
 
-    if len(numeric_cols) < 2:
+    if len(numeric_cols) < 1:
         return None
 
-    # comparar soma vs total registrado
     for c in numeric_cols[:10]:
         s = 0
         any_val = False
@@ -347,7 +360,6 @@ def rule_totals_divergence(table: Dict) -> Optional[Dict]:
         if total_val is None:
             continue
 
-        # tolerância: 0,5% ou 1 unidade (para evitar ruído)
         tol = max(1, abs(s) * 0.005)
         if abs(s - total_val) > tol:
             return {
@@ -358,40 +370,9 @@ def rule_totals_divergence(table: Dict) -> Optional[Dict]:
                 "detail": f"Coluna {c+1}: soma={s} vs total={total_val} (dif={s-total_val:+.2f})",
                 "recommendation": "Recalcular total e revisar linhas incluídas/excluídas."
             }
-
-    return None
-
-def rule_duplicated_rows_strict(table: Dict) -> Optional[Dict]:
-    """
-    Só acusa duplicidade se:
-    - rótulo (coluna 0) igual (normalizado) E
-    - assinatura numérica igual
-    """
-    rows = table.get("rows_raw", [])
-    if not rows or len(rows) < 2:
-        return None
-
-    seen = {}
-    for idx, row in enumerate(rows):
-        label = normalize_text(row[0]) if row else ""
-        sig = tuple(parse_number_ptbr(cell) for cell in row[1:])  # ignora label
-        key = (label.lower(), sig)
-        if key in seen and label != "":
-            return {
-                "severity": "WARN",
-                "table": table["nome"],
-                "rule": "duplicated_rows_strict",
-                "issue": "Linha possivelmente duplicada",
-                "detail": f"Linhas {seen[key]+1} e {idx+1} com mesmo rótulo e mesmos valores.",
-                "recommendation": "Verificar duplicação estrutural (cópia/colagem)."
-            }
-        seen[key] = idx
     return None
 
 def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
-    """
-    Variação abrupta/apenas série temporal: compara ANOS na MESMA LINHA.
-    """
     headers = table.get("headers", [])
     rows = table.get("rows_raw", [])
     name = table.get("nome", "")
@@ -404,10 +385,8 @@ def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
     if not is_ts or len(year_cols) < 2:
         return None
 
-    for r_i, row in enumerate(rows, 1):
-        # categoria/rótulo é a primeira célula
-        categoria = normalize_text(row[0]) if row else f"Linha {r_i}"
-        # coletar anos em ordem de colunas
+    for row in rows:
+        categoria = normalize_text(row[0]) if row else "Linha"
         values = []
         for c in year_cols:
             if c < len(row):
@@ -420,12 +399,11 @@ def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
 
         for i in range(len(values) - 1):
             y0, v0 = values[i]
-            y1, v1 = values[i+1]
+            y1, v1 = values[i + 1]
             if v0 == 0:
                 continue
             var_pct = ((v1 - v0) / v0) * 100
 
-            # thresholds: você pode ajustar
             if abs(var_pct) >= 500:
                 return {
                     "severity": "FAIL",
@@ -447,79 +425,6 @@ def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
 
     return None
 
-
-# =========================
-# Siglas / nomenclatura / caixa alta
-# =========================
-
-# Exemplo (cole TODAS as suas siglas aqui)
-SIGLAS_ALLOWLIST = {
-    "CEPE","CEG","CEX","CPP","CCD","CAD","CAC","CGP","CPLAD","CAPRO","CDH",
-    "VRT","OUV","PF","AUD","AAMC","GRE","PRC","INFRA","SEMA","SPI",
-    "DEG","DAIA","DIEG","DTG","DAPLI","DEX","DTE","DDIS","DDC","DPG","DIRIC","DIRPG",
-    "DPI","DIRPE","DPA","CDT","DAC","DDS","DEAC","DASU","DRU","DACES","DGP","DCADE","DAP","DSO","DPAM",
-    "DAF","DIMEX","DACP","DGM","DCF","DCO","DCA","DPO","DPL","DOR","DPR","DAI",
-    "BCE","STI","EDU","FAL","HUB","ACE","PCTec","UnB-TV","CEAD","SAA","SECOM","INT","CERI","SOC","SDH"
-}
-
-SIGLA_TOKEN_RE = re.compile(r'\b[A-Z]{2,6}\b')
-
-def rule_acronyms_and_naming(table: Dict) -> Optional[Dict]:
-    """
-    - aponta siglas fora da allowlist (em headers e primeira coluna)
-    - aponta uso inconsistente de caixa alta em rótulos do tipo "Total" vs "TOTAL"
-    - aponta abreviações irregulares simples (ex.: "Depto" vs "Departamento")
-    """
-    headers = [normalize_text(h) for h in table.get("headers", [])]
-    rows = table.get("rows_raw", [])
-
-    suspects = set()
-    text_pool = " ".join(headers)
-
-    # pega também primeira coluna (rótulos)
-    for row in rows[:80]:
-        if row:
-            text_pool += " " + normalize_text(row[0])
-
-    for tok in SIGLA_TOKEN_RE.findall(text_pool):
-        if tok not in SIGLAS_ALLOWLIST:
-            suspects.add(tok)
-
-    # caixa alta inconsistente (Total/TOTAL misturado)
-    total_forms = set()
-    for row in rows:
-        if row:
-            lab = normalize_text(row[0])
-            if lab.lower().startswith("total"):
-                total_forms.add(lab)
-
-    if suspects:
-        return {
-            "severity": "WARN",
-            "table": table["nome"],
-            "rule": "unknown_acronyms",
-            "issue": "Siglas não padronizadas (fora da lista)",
-            "detail": f"Exemplos: {', '.join(sorted(list(suspects))[:15])}",
-            "recommendation": "Revisar siglas, padronizar ou adicionar à lista oficial."
-        }
-
-    if len(total_forms) >= 2:
-        return {
-            "severity": "WARN",
-            "table": table["nome"],
-            "rule": "inconsistent_uppercase",
-            "issue": "Uso inconsistente de caixa alta em 'Total'",
-            "detail": f"Formas encontradas: {', '.join(sorted(total_forms))}",
-            "recommendation": "Padronizar (ex.: sempre 'Total' ou sempre 'TOTAL')."
-        }
-
-    return None
-
-
-# =========================
-# Tabelas vazias / zeradas
-# =========================
-
 def rule_table_empty_or_all_zero(table: Dict) -> Optional[Dict]:
     rows = table.get("rows_raw", [])
     if not rows:
@@ -532,92 +437,61 @@ def rule_table_empty_or_all_zero(table: Dict) -> Optional[Dict]:
             "recommendation": "Inserir dados ou remover tabela."
         }
 
-    # considera numéricos > 0 como evidência de dado
-    has_positive = False
+    has_nonzero = False
     for row in rows:
         for cell in row[1:]:
             v = parse_number_ptbr(cell)
             if v is not None and v != 0:
-                has_positive = True
+                has_nonzero = True
                 break
-        if has_positive:
+        if has_nonzero:
             break
 
-    if not has_positive:
+    if not has_nonzero:
         return {
             "severity": "FAIL",
             "table": table["nome"],
             "rule": "table_all_zero",
             "issue": "Tabela integralmente zerada (ou sem números válidos)",
             "detail": "Não foi encontrado valor numérico diferente de zero.",
-            "recommendation": "Confirmar se a tabela deveria ter dados; se sim, revisar extração/consulta."
+            "recommendation": "Confirmar se deveria haver dados; se sim, revisar extração/consulta."
         }
 
     return None
 
 
 # =========================
-# Pipeline de análise
+# Pipeline
 # =========================
 
 def analyze_table(table: Dict, base_year: int) -> List[Dict]:
     issues = []
 
-    # 0) vazia / zerada (bloqueia parte das outras)
     issue = rule_table_empty_or_all_zero(table)
     if issue:
         issues.append(issue)
-        # ainda vale checar fonte/ano? opcional. Eu manteria:
-        src_issue = rule_missing_source(table)
-        if src_issue:
-            issues.append(src_issue)
-        year_issue = rule_year_base_mismatch(table, base_year)
-        if year_issue:
-            issues.append(year_issue)
+        # ainda checa fonte/ano
+        src = rule_missing_source(table)
+        if src:
+            issues.append(src)
+        yr = rule_year_base_mismatch(table, base_year)
+        if yr:
+            issues.append(yr)
         return issues
 
-    # 1) fonte (corrigido: pega itálico/rodapé)
-    issue = rule_missing_source(table)
-    if issue:
-        issues.append(issue)
-
-    # 2) ano-base
-    issue = rule_year_base_mismatch(table, base_year)
-    if issue:
-        issues.append(issue)
-
-    # 3) células em branco
-    issue = rule_blank_cells(table)
-    if issue:
-        issues.append(issue)
-
-    # 4) separadores
-    issue = rule_thousand_separator_inconsistency(table)
-    if issue:
-        issues.append(issue)
-
-    # 5) totais
-    issue = rule_totals_divergence(table)
-    if issue:
-        issues.append(issue)
-
-    # 6) variações só em série histórica (horizontal)
-    issue = rule_extreme_year_variation(table)
-    if issue:
-        issues.append(issue)
-
-    # 7) duplicidades (estritas)
-    issue = rule_duplicated_rows_strict(table)
-    if issue:
-        issues.append(issue)
-
-    # 8) siglas / padronização
-    issue = rule_acronyms_and_naming(table)
-    if issue:
-        issues.append(issue)
+    for rule in (
+        rule_missing_source,
+        lambda t: rule_year_base_mismatch(t, base_year),
+        rule_blank_cells,
+        rule_thousand_separator_inconsistency,
+        rule_totals_divergence,
+        rule_extreme_year_variation,
+    ):
+        out = rule(table)
+        if out:
+            issues.append(out)
 
     return issues
-
 
 def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
     issues = []
@@ -629,7 +503,7 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
             "table": "Documento",
             "rule": "document",
             "issue": "Nenhuma tabela",
-            "detail": "Arquivo sem tabelas HTML (ou bloqueio de acesso).",
+            "detail": f"{diag['status']}",
             "recommendation": "Verificar URL e se o conteúdo é renderizado via JS."
         })
         return issues
@@ -648,4 +522,73 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
         issues.extend(analyze_table(table, base_year))
 
     return issues
+
+
+# =========================
+# Relatório TXT
+# =========================
+
+def generate_txt_report(issues: List[Dict], url: str, report_year: int, base_year: int) -> str:
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    fail = [i for i in issues if i["severity"] == "FAIL"]
+    warn = [i for i in issues if i["severity"] == "WARN"]
+    passr = [i for i in issues if i["severity"] == "PASS"]
+
+    txt = "=" * 80 + "\nAUDITORIA DO ANUÁRIO ESTATÍSTICO UnB\n" + "=" * 80 + "\n\n"
+    txt += f"Data: {now}\nURL: {url}\nAno relatório: {report_year}\nAno-base: {base_year}\n\n"
+    txt += f"FAIL: {len(fail)} | WARN: {len(warn)} | PASS: {len(passr)}\n\n"
+
+    if fail:
+        txt += "ERROS:\n" + "-" * 40 + "\n"
+        for i, issue in enumerate(fail, 1):
+            txt += f"{i}. {issue['issue']} ({issue['table']})\n   {issue['detail']}\n"
+
+    if warn:
+        txt += "\nAVISOS:\n" + "-" * 40 + "\n"
+        for i, issue in enumerate(warn, 1):
+            txt += f"{i}. {issue['issue']} ({issue['table']})\n   {issue['detail']}\n"
+
+    return txt
+
+
+# =========================
+# Endpoints
+# =========================
+
+HTML = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><title>Auditoria UnB</title></head>
+<body style="font-family:Arial;padding:20px">
+<h2>Auditoria - Anuário UnB</h2>
+<p>Backend OK. Use o frontend separado ou chame POST /audit.</p>
+</body></html>"""
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return HTML
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/audit")
+def audit(req: AuditRequest):
+    try:
+        issues = run_audit(req.url, req.report_year, req.base_year)
+        return {"status": "ok", "issues": issues}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/export/txt")
+def export_txt(data: dict):
+    txt = generate_txt_report(
+        data.get("issues", []),
+        data.get("url", ""),
+        int(data.get("report_year", 2025)),
+        int(data.get("base_year", 2024)),
+    )
+    return StreamingResponse(
+        iter([txt.encode("utf-8")]),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=auditoria-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"}
+    )
 
