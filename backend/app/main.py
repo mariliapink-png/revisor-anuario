@@ -11,15 +11,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 
-# ============================================================
-# FastAPI app (ISSO resolve o erro do Render: app.main:app)
-# ============================================================
-
 app = FastAPI(title="Auditoria Anuário UnB")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # se quiser restringir depois, dá.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,49 +42,34 @@ def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def parse_number_ptbr(s: str) -> Optional[Any]:
-    """
-    Converte string numérica PT-BR para número (int/float).
-    Retorna None se não numérico.
-    """
+    """Converte string numérica PT-BR para número (int/float)."""
     if not s or not isinstance(s, str):
         return None
     s = normalize_text(s)
-
-    # remove % no final
     s = re.sub(r'[%]$', '', s).strip()
 
-    # 1.234.567
     if re.match(r'^\d{1,3}(\.\d{3})+$', s):
         return int(s.replace('.', ''))
-
-    # 1.234,56
     if re.match(r'^\d{1,3}(\.\d{3})*,\d+$', s):
         try:
             return float(s.replace('.', '').replace(',', '.'))
         except:
             return None
-
-    # 1234,56
     if re.match(r'^\d+,\d+$', s):
         try:
             return float(s.replace(',', '.'))
         except:
             return None
-
-    # 1234.56 (EN decimal)
     if re.match(r'^\d+\.\d+$', s):
         try:
             return float(s)
         except:
             return None
-
-    # 1234
     if re.match(r'^\d+$', s):
         try:
             return int(s)
         except:
             return None
-
     return None
 
 
@@ -97,21 +78,15 @@ def parse_number_ptbr(s: str) -> Optional[Any]:
 # ============================================================
 
 def download_page(url: str) -> Tuple[str, Dict]:
-    """
-    Baixa HTML. Importante: o anuário pode ser conteúdo estático já renderizado,
-    mas se houver páginas com renderização forte via JS, requests pode pegar HTML incompleto.
-    """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "pt-BR,pt;q=0.9",
     }
-
     try:
         resp = requests.get(url, timeout=30, headers=headers)
         resp.encoding = "utf-8"
         html = resp.text
-
         soup = BeautifulSoup(html, "html.parser")
         tables = soup.find_all("table")
         return html, {
@@ -125,7 +100,7 @@ def download_page(url: str) -> Tuple[str, Dict]:
 
 
 # ============================================================
-# Extração robusta de tabelas + contexto
+# Extração de tabelas
 # ============================================================
 
 def extract_tables_from_html(html: str) -> List[Dict]:
@@ -139,20 +114,17 @@ def extract_tables_from_html(html: str) -> List[Dict]:
         if not table_name:
             table_name = normalize_text(table_elem.get("aria-label", "")) or f"Tabela {table_idx}"
 
-        # headers
         headers = []
         thead = table_elem.find("thead")
         if thead:
             headers = [normalize_text(th.get_text(" ", strip=True)) for th in thead.find_all("th")]
         else:
-            # fallback: primeira linha com th
             first_tr = table_elem.find("tr")
             if first_tr:
                 ths = first_tr.find_all("th")
                 if ths:
                     headers = [normalize_text(th.get_text(" ", strip=True)) for th in ths]
 
-        # rows
         rows_raw = []
         tbody = table_elem.find("tbody") or table_elem
         for tr in tbody.find_all("tr"):
@@ -161,7 +133,6 @@ def extract_tables_from_html(html: str) -> List[Dict]:
             if any(c != "" for c in cells):
                 rows_raw.append(cells)
 
-        # contexto após tabela (para "Fonte:" fora/itálico)
         around_text = []
         sib = table_elem
         for _ in range(8):
@@ -206,10 +177,6 @@ def has_time_series_indicator(text: str) -> bool:
     return any(re.search(p, t) for p in indicators)
 
 def find_source_text(table: Dict) -> Optional[str]:
-    """
-    Encontra "Fonte:" dentro do HTML da tabela OU no texto logo abaixo (around_text),
-    incluindo <i>/<em> (porque BeautifulSoup get_text pega itálico também).
-    """
     html = table.get("html", "")
     soup = BeautifulSoup(html, "html.parser")
     inside_txt = normalize_text(soup.get_text(" ", strip=True))
@@ -227,10 +194,9 @@ def find_source_text(table: Dict) -> Optional[str]:
 
 
 # ============================================================
-# Checklist: regras
+# Regras de validação
 # ============================================================
 
-# 1) Fonte presente (não falhar por itálico)
 def rule_missing_source(table: Dict) -> Optional[Dict]:
     src = find_source_text(table)
     if not src:
@@ -239,12 +205,11 @@ def rule_missing_source(table: Dict) -> Optional[Dict]:
             "table": table["nome"],
             "rule": "missing_source",
             "issue": "Fonte não identificada",
-            "detail": "Não foi encontrado 'Fonte:' dentro da tabela nem no rodapé imediatamente abaixo.",
-            "recommendation": "Garantir 'Fonte: ...' no rodapé da tabela/gráfico/figura."
+            "detail": "Não foi encontrado 'Fonte:' dentro da tabela nem no rodapé abaixo.",
+            "recommendation": "Garantir 'Fonte: ...' no rodapé da tabela/figura."
         }
     return None
 
-# 2) Células em branco
 def rule_blank_cells(table: Dict) -> Optional[Dict]:
     rows = table.get("rows_raw", [])
     if not rows:
@@ -264,12 +229,11 @@ def rule_blank_cells(table: Dict) -> Optional[Dict]:
             "table": table["nome"],
             "rule": "blank_cells",
             "issue": "Células em branco",
-            "detail": f"Exemplos (linha,coluna): {', '.join([f'({r},{c})' for r,c in blanks])}",
-            "recommendation": "Preencher ou justificar campos vazios (ou usar '0' quando aplicável)."
+            "detail": f"Exemplos (linha,coluna): {', '.join([f'({r},{c})' for r,c in blanks[:10]])}",
+            "recommendation": "Preencher ou justificar campos vazios."
         }
     return None
 
-# 3) Ano-base (2024) deve aparecer em título/cabeçalho/legendas da tabela (com tolerância para séries)
 def rule_year_base_mismatch(table: Dict, base_year: int) -> Optional[Dict]:
     name = normalize_text(table.get("nome", ""))
     headers = [normalize_text(h) for h in table.get("headers", [])]
@@ -279,31 +243,17 @@ def rule_year_base_mismatch(table: Dict, base_year: int) -> Optional[Dict]:
     if not years:
         return None
 
-    # se não inclui o ano-base, provável problema (a menos que seja tabela "conceitual" sem ano, mas aí nem teria anos)
     if str(base_year) not in years:
         return {
             "severity": "FAIL",
             "table": table["nome"],
             "rule": "year_base_mismatch",
             "issue": f"Ano-base ({base_year}) não aparece",
-            "detail": f"Anos detectados no título/cabeçalho: {', '.join(sorted(years))}",
-            "recommendation": f"Atualizar título/cabeçalho/legenda para refletir o ano-base {base_year} (ou série incluindo {base_year})."
+            "detail": f"Anos detectados: {', '.join(sorted(years))}",
+            "recommendation": f"Atualizar título/cabeçalho para refletir ano-base {base_year}."
         }
-
-    # resíduo típico: título “..., 2023” em anuário ano-base 2024
-    if "2023" in years and not has_time_series_indicator(name) and str(base_year) in years:
-        return {
-            "severity": "WARN",
-            "table": table["nome"],
-            "rule": "year_possible_residue",
-            "issue": "Possível resíduo de ano no título/cabeçalho",
-            "detail": f"Foram detectados 2023 e {base_year} em tabela que não parece série histórica.",
-            "recommendation": "Confirmar se o texto foi realmente atualizado."
-        }
-
     return None
 
-# 4) Separadores (milhar/decimal)
 def rule_separator_standardization(table: Dict) -> Optional[Dict]:
     rows = table.get("rows_raw", [])
     if not rows:
@@ -334,8 +284,8 @@ def rule_separator_standardization(table: Dict) -> Optional[Dict]:
             "severity": "FAIL",
             "table": table["nome"],
             "rule": "mixed_decimal_separators",
-            "issue": "Mistura de separadores decimais (',' e '.')",
-            "detail": f"Padrões detectados: {counts}",
+            "issue": "Mistura de separadores decimais",
+            "detail": f"Padrões: {counts}",
             "recommendation": "Padronizar decimal PT-BR (vírgula)."
         }
 
@@ -345,13 +295,12 @@ def rule_separator_standardization(table: Dict) -> Optional[Dict]:
             "table": table["nome"],
             "rule": "inconsistent_thousand_separator",
             "issue": "Padronização de milhar inconsistente",
-            "detail": f"Padrões detectados: {counts}",
-            "recommendation": "Escolher um padrão (ex.: sempre 1.234 para milhar) e aplicar no capítulo."
+            "detail": f"Padrões: {counts}",
+            "recommendation": "Padronizar milhar (sempre 1.234)."
         }
 
     return None
 
-# 5) Tabela vazia/zerada
 def rule_table_empty_or_all_zero(table: Dict) -> Optional[Dict]:
     rows = table.get("rows_raw", [])
     if not rows:
@@ -379,14 +328,13 @@ def rule_table_empty_or_all_zero(table: Dict) -> Optional[Dict]:
             "severity": "FAIL",
             "table": table["nome"],
             "rule": "table_all_zero",
-            "issue": "Tabela integralmente zerada (ou sem números válidos)",
-            "detail": "Não foi encontrado valor numérico diferente de zero.",
-            "recommendation": "Confirmar se deveria haver dados; se sim, revisar extração/consulta."
+            "issue": "Tabela integralmente zerada",
+            "detail": "Sem valores numéricos diferentes de zero.",
+            "recommendation": "Revisar extração/consulta dos dados."
         }
 
     return None
 
-# 6) Divergência de totais (só quando há linha Total e colunas numéricas)
 def rule_totals_divergence(table: Dict) -> Optional[Dict]:
     rows = table.get("rows_raw", [])
     if not rows or len(rows) < 3:
@@ -400,8 +348,7 @@ def rule_totals_divergence(table: Dict) -> Optional[Dict]:
     if total_idx is None or total_idx == 0:
         return None
 
-    n_cols = max(len(r) for r in rows)
-    # colunas numéricas candidatas (ignora col 0)
+    n_cols = max(len(r) for r in rows) if rows else 0
     numeric_cols = []
     for c in range(1, n_cols):
         vals = 0
@@ -431,20 +378,19 @@ def rule_totals_divergence(table: Dict) -> Optional[Dict]:
         if total_val is None:
             continue
 
-        tol = max(1.0, abs(s) * 0.005)  # 0,5% ou 1 unidade
+        tol = max(1.0, abs(s) * 0.005)
         if abs(s - float(total_val)) > tol:
             return {
                 "severity": "FAIL",
                 "table": table["nome"],
                 "rule": "totals_divergence",
                 "issue": "Divergência em total",
-                "detail": f"Coluna {c+1}: soma={s:.2f} vs total={float(total_val):.2f} (dif={s-float(total_val):+.2f})",
-                "recommendation": "Recalcular total e revisar linhas incluídas/excluídas."
+                "detail": f"Coluna {c+1}: soma={s:.2f} vs total={float(total_val):.2f}",
+                "recommendation": "Recalcular total e revisar."
             }
 
     return None
 
-# 7) Variações abruptas em séries históricas (HORIZONTAL, na MESMA LINHA)
 def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
     headers = table.get("headers", [])
     rows = table.get("rows_raw", [])
@@ -478,7 +424,6 @@ def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
 
             var_pct = ((v1 - v0) / v0) * 100
 
-            # thresholds (ajuste se quiser)
             if abs(var_pct) >= 500:
                 return {
                     "severity": "FAIL",
@@ -486,7 +431,7 @@ def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
                     "rule": "extreme_year_variation",
                     "issue": "Aumento/queda abrupta (série histórica)",
                     "detail": f"Categoria '{categoria}': {y0}={v0:g} → {y1}={v1:g} ({var_pct:+.1f}%)",
-                    "recommendation": "Checar erro de digitação, mudança de critério, ou dado faltante em um dos anos."
+                    "recommendation": "Checar erro de digitação ou mudança de critério."
                 }
             elif abs(var_pct) >= 200:
                 return {
@@ -495,12 +440,11 @@ def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
                     "rule": "sharp_year_variation",
                     "issue": "Variação expressiva (série histórica)",
                     "detail": f"Categoria '{categoria}': {y0}={v0:g} → {y1}={v1:g} ({var_pct:+.1f}%)",
-                    "recommendation": "Validar com a fonte (pode ser efeito real)."
+                    "recommendation": "Validar com a fonte."
                 }
 
     return None
 
-# 8) Duplicidades estruturais (SÓ se rótulo igual + valores iguais)
 def rule_duplicated_rows_strict(table: Dict) -> Optional[Dict]:
     rows = table.get("rows_raw", [])
     if not rows or len(rows) < 2:
@@ -520,19 +464,13 @@ def rule_duplicated_rows_strict(table: Dict) -> Optional[Dict]:
                 "table": table["nome"],
                 "rule": "duplicated_rows_strict",
                 "issue": "Possível duplicidade estrutural",
-                "detail": f"Linhas {seen[key]+1} e {idx+1} com mesmo rótulo e mesmos valores.",
-                "recommendation": "Verificar se houve repetição por erro de geração/edição."
+                "detail": f"Linhas {seen[key]+1} e {idx+1} com mesmo rótulo e valores.",
+                "recommendation": "Verificar se houve repetição por erro."
             }
 
         seen[key] = idx
 
     return None
-
-
-# ============================================================
-# Siglas / padrões de nomenclatura / caixa alta / abreviações
-# (você pode expandir essa lista quando quiser)
-# ============================================================
 
 SIGLAS_ALLOWLIST = {
     "CEPE","CEG","CEX","CPP","CCD","CAD","CAC","CGP","CPLAD","CAPRO","CDH",
@@ -558,38 +496,21 @@ def rule_acronyms_and_naming(table: Dict) -> Optional[Dict]:
         if tok not in SIGLAS_ALLOWLIST:
             suspects.add(tok)
 
-    total_forms = set()
-    for row in rows:
-        if row:
-            lab = normalize_text(row[0])
-            if lab.lower().startswith("total"):
-                total_forms.add(lab)
-
     if suspects:
         return {
             "severity": "WARN",
             "table": table["nome"],
             "rule": "unknown_acronyms",
-            "issue": "Siglas fora do padrão (não estão na lista oficial)",
+            "issue": "Siglas fora do padrão",
             "detail": f"Exemplos: {', '.join(sorted(list(suspects))[:20])}",
-            "recommendation": "Padronizar siglas no texto ou adicionar à lista oficial."
-        }
-
-    if len(total_forms) >= 2:
-        return {
-            "severity": "WARN",
-            "table": table["nome"],
-            "rule": "inconsistent_uppercase_total",
-            "issue": "Inconsistência de caixa alta (Total/TOTAL)",
-            "detail": f"Formas encontradas: {', '.join(sorted(total_forms))}",
-            "recommendation": "Padronizar (ex.: sempre 'Total' ou sempre 'TOTAL')."
+            "recommendation": "Padronizar siglas."
         }
 
     return None
 
 
 # ============================================================
-# Análise de tabela (pipeline)
+# Análise de tabela
 # ============================================================
 
 def analyze_table(table: Dict, base_year: int) -> List[Dict]:
@@ -598,7 +519,6 @@ def analyze_table(table: Dict, base_year: int) -> List[Dict]:
     issue = rule_table_empty_or_all_zero(table)
     if issue:
         issues.append(issue)
-        # mesmo vazia: vale apontar fonte/ano, porque é revisão editorial
         src_issue = rule_missing_source(table)
         if src_issue:
             issues.append(src_issue)
@@ -625,7 +545,7 @@ def analyze_table(table: Dict, base_year: int) -> List[Dict]:
 
 
 # ============================================================
-# Auditoria completa
+# Auditoria
 # ============================================================
 
 def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
@@ -638,8 +558,8 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
             "table": "Documento",
             "rule": "document",
             "issue": "Nenhuma tabela encontrada",
-            "detail": f"Status={diag.get('status')} HTTP={diag.get('http_status')}",
-            "recommendation": "Verificar URL; se a página renderiza via JS pesado, pode precisar de extração diferente."
+            "detail": f"Status={diag.get('status')}",
+            "recommendation": "Verificar URL."
         })
         return issues
 
@@ -647,9 +567,9 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
         "severity": "PASS",
         "table": "Documento",
         "rule": "document",
-        "issue": f"✓ {diag['contagem_tables']} tabela(s) encontrada(s)",
+        "issue": f"✓ {diag['contagem_tables']} tabela(s)",
         "detail": f"HTML: {diag['tamanho_html_kb']:.1f} KB",
-        "recommendation": "Analisando tabelas..."
+        "recommendation": "Analisando..."
     })
 
     tables = extract_tables_from_html(html)
@@ -663,7 +583,7 @@ def generate_txt_report(issues: List[Dict], url: str, report_year: int, base_yea
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
     txt = "=" * 80 + "\nAUDITORIA DO ANUÁRIO ESTATÍSTICO UnB\n" + "=" * 80 + "\n\n"
-    txt += f"Data: {now}\nURL: {url}\nAno do Anuário: {report_year}\nAno-base: {base_year}\n\n"
+    txt += f"Data: {now}\nURL: {url}\nAno: {report_year}\nAno-base: {base_year}\n\n"
 
     fail = [i for i in issues if i["severity"] == "FAIL"]
     warn = [i for i in issues if i["severity"] == "WARN"]
@@ -685,21 +605,167 @@ def generate_txt_report(issues: List[Dict], url: str, report_year: int, base_yea
 
 
 # ============================================================
+# HTML FRONTEND (embutido)
+# ============================================================
+
+HTML_FRONTEND = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auditoria - Anuário UnB</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #003366 0%, #2E1D86 100%); min-height: 100vh; padding: 20px; }
+        .container { background: white; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); max-width: 1000px; margin: 0 auto; padding: 40px; }
+        h1 { color: #003366; margin-bottom: 10px; }
+        .subtitle { color: #666; margin-bottom: 30px; font-size: 14px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; color: #003366; font-weight: 600; margin-bottom: 8px; }
+        input { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 6px; }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        button { width: 100%; padding: 12px; background: linear-gradient(135deg, #003366 0%, #2E1D86 100%); color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; margin-top: 20px; }
+        button:hover { opacity: 0.9; }
+        #loading { display: none; text-align: center; padding: 20px; }
+        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #003366; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 15px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .results { display: none; margin-top: 30px; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 30px; }
+        .stat { text-align: center; padding: 20px; background: #f8f9fa; border-radius: 6px; }
+        .stat-number { font-size: 32px; font-weight: bold; color: #003366; }
+        .issue-item { padding: 20px; margin-bottom: 15px; border-radius: 8px; border-left: 5px solid; }
+        .issue-item.pass { background: #e8f5e9; border-left-color: #4caf50; }
+        .issue-item.warn { background: #fff3e0; border-left-color: #ff9800; }
+        .issue-item.fail { background: #ffebee; border-left-color: #f44336; }
+        .badge { display: inline-block; padding: 4px 12px; border-radius: 4px; font-size: 12px; font-weight: 600; color: white; margin-left: 10px; }
+        .badge-pass { background: #4caf50; }
+        .badge-warn { background: #ff9800; }
+        .badge-fail { background: #f44336; }
+        .rule-tag { display: inline-block; padding: 2px 8px; background: #f0f0f0; border-radius: 3px; font-size: 11px; margin-top: 8px; }
+        .export-button { background: #27ae60; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📋 Auditoria - Anuário UnB</h1>
+        <p class="subtitle">Análise de qualidade, consistência e conformidade</p>
+
+        <div id="form">
+            <div class="form-group">
+                <label>URL do Anuário</label>
+                <input type="url" id="url" value="https://anuariounb2025.netlify.app/">
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Ano do Anuário</label>
+                    <input type="number" id="year" value="2025">
+                </div>
+                <div class="form-group">
+                    <label>Ano-base</label>
+                    <input type="number" id="baseYear" value="2024">
+                </div>
+            </div>
+            <button onclick="audit()">🔍 Executar Auditoria</button>
+        </div>
+
+        <div id="loading">
+            <div class="spinner"></div>
+            <p>Auditando...</p>
+        </div>
+
+        <div id="results" class="results">
+            <div class="stats" id="stats"></div>
+            <h2 style="color: #003366; margin-bottom: 20px;">Resultados:</h2>
+            <div id="content"></div>
+            <button class="export-button" onclick="downloadReport()">📥 Baixar Relatório (TXT)</button>
+        </div>
+    </div>
+
+    <script>
+        let lastIssues = [], lastUrl = '', lastYear = 2025, lastBase = 2024;
+
+        async function audit() {
+            const url = document.getElementById('url').value;
+            const year = parseInt(document.getElementById('year').value);
+            const base = parseInt(document.getElementById('baseYear').value);
+            lastUrl = url; lastYear = year; lastBase = base;
+
+            document.getElementById('form').style.display = 'none';
+            document.getElementById('loading').style.display = 'block';
+
+            try {
+                const res = await fetch('/audit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, report_year: year, base_year: base })
+                });
+                const data = await res.json();
+                lastIssues = data.issues;
+                showResults(data.issues);
+            } catch (e) {
+                alert('Erro: ' + e.message);
+                document.getElementById('form').style.display = 'block';
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+
+        function showResults(issues) {
+            const pass = issues.filter(i => i.severity === 'PASS').length;
+            const warn = issues.filter(i => i.severity === 'WARN').length;
+            const fail = issues.filter(i => i.severity === 'FAIL').length;
+
+            document.getElementById('stats').innerHTML = `
+                <div class="stat"><div class="stat-number" style="color: #4caf50;">${pass}</div><div>OK</div></div>
+                <div class="stat"><div class="stat-number" style="color: #ff9800;">${warn}</div><div>Avisos</div></div>
+                <div class="stat"><div class="stat-number" style="color: #f44336;">${fail}</div><div>Erros</div></div>
+            `;
+
+            document.getElementById('content').innerHTML = issues.map(i => `
+                <div class="issue-item ${i.severity.toLowerCase()}">
+                    <div style="display: flex; justify-content: space-between;">
+                        <strong>${i.table}</strong>
+                        <span class="badge badge-${i.severity.toLowerCase()}">${i.severity}</span>
+                    </div>
+                    <div style="color: #333; font-weight: 500; margin: 8px 0;">${i.issue}</div>
+                    <div style="color: #555; font-size: 14px; margin: 8px 0;">${i.detail}</div>
+                    <div style="color: #666; font-size: 13px; padding: 10px; background: rgba(0,0,0,0.03); border-radius: 4px;">💡 ${i.recommendation}</div>
+                    <div class="rule-tag">Regra: ${i.rule}</div>
+                </div>
+            `).join('');
+
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('results').style.display = 'block';
+        }
+
+        function downloadReport() {
+            fetch('/export/txt', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ issues: lastIssues, url: lastUrl, report_year: lastYear, base_year: lastBase })
+            })
+            .then(r => r.blob())
+            .then(blob => {
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `auditoria-${Date.now()}.txt`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+# ============================================================
 # Rotas
 # ============================================================
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    # Para não quebrar seu iframe: mensagem clara e simples
-    return """
-    <h2>Backend OK ✅</h2>
-    <p>Use o frontend separado (ex.: seu <code>index.html</code>) ou chame:</p>
-    <ul>
-      <li><code>POST /audit</code></li>
-      <li><code>POST /export/txt</code></li>
-      <li><code>GET /health</code></li>
-    </ul>
-    """
+    return HTML_FRONTEND
 
 @app.get("/health")
 def health():
