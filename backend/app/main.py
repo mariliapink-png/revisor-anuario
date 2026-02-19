@@ -6,6 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 from typing import List, Dict, Tuple, Optional, Any
+from collections import defaultdict
 
 app = FastAPI(title="Auditoria Anuário UnB")
 
@@ -25,14 +26,7 @@ class AuditRequest(BaseModel):
 # ===== PARSER NUMÉRICO ROBUSTO (PT-BR) =====
 
 def parse_number_ptbr(s: str) -> Optional[Any]:
-    """
-    Converte string numérica PT-BR para número (int ou float).
-    Ordem de prioridade:
-    1. Padrão milhar brasileiro: "8.415", "1.769.277" => int
-    2. Decimal brasileiro: "10.490,50" => float
-    3. Decimal ponto sem milhar: "8.5" => float
-    4. Nenhum => None
-    """
+    """Converte string numérica PT-BR para número (int ou float)."""
     if not s or not isinstance(s, str):
         return None
     
@@ -98,7 +92,7 @@ def download_page(url: str) -> Tuple[str, Dict]:
 # ===== EXTRAÇÃO DE TABELAS =====
 
 def extract_tables_from_html(html: str) -> List[Dict]:
-    """Extrai tabelas com busca ampliada de Fonte"""
+    """Extrai tabelas com contexto ampliado"""
     tables = []
     soup = BeautifulSoup(html, 'html.parser')
     
@@ -108,14 +102,12 @@ def extract_tables_from_html(html: str) -> List[Dict]:
         if caption:
             table_name = caption.get_text(strip=True)
         
-        # Headers
         headers = []
         thead = table_elem.find('thead')
         if thead:
             for th in thead.find_all('th'):
                 headers.append(th.get_text(strip=True))
         
-        # Dados brutos
         rows_raw = []
         tbody = table_elem.find('tbody')
         if tbody:
@@ -124,7 +116,6 @@ def extract_tables_from_html(html: str) -> List[Dict]:
                 if cells:
                     rows_raw.append(cells)
         
-        # Buscar Fonte em raio ampliado
         fonte = find_fonte_ampliado(table_elem, soup)
         
         if rows_raw:
@@ -140,16 +131,13 @@ def extract_tables_from_html(html: str) -> List[Dict]:
     return tables
 
 def find_fonte_ampliado(table_elem, soup) -> str:
-    """Procura por 'Fonte' em raio ampliado (5 antes, 10 depois) + classes comuns"""
-    
-    # 1. tfoot
+    """Procura por Fonte em raio ampliado"""
     tfoot = table_elem.find('tfoot')
     if tfoot:
         tfoot_text = tfoot.get_text(strip=True)
         if re.search(r'[Ff]onte', tfoot_text):
             return tfoot_text[:200]
     
-    # 2. 5 elementos anteriores
     prev_elem = table_elem.find_previous()
     for _ in range(5):
         if prev_elem:
@@ -158,7 +146,6 @@ def find_fonte_ampliado(table_elem, soup) -> str:
                 return text[:200]
             prev_elem = prev_elem.find_previous()
     
-    # 3. 10 elementos posteriores
     next_elem = table_elem.find_next()
     for _ in range(10):
         if next_elem:
@@ -169,15 +156,13 @@ def find_fonte_ampliado(table_elem, soup) -> str:
                 break
             next_elem = next_elem.find_next()
     
-    # 4. Classes comuns
     for class_name in ['source', 'caption', 'note', 'fonte']:
         elem = soup.find(class_=class_name)
         if elem:
             text = elem.get_text(strip=True)
-            if 'Fonte' in text or 'fonte' in text:
+            if 'Fonte' in text:
                 return text[:200]
     
-    # 5. figcaption
     figcaption = soup.find('figcaption')
     if figcaption:
         text = figcaption.get_text(strip=True)
@@ -186,163 +171,370 @@ def find_fonte_ampliado(table_elem, soup) -> str:
     
     return ""
 
-# ===== ANÁLISE DE TABELAS =====
+# ===== NOVAS REGRAS DO CAPÍTULO 9 =====
 
-def analyze_table(table: Dict) -> List[Dict]:
-    """Analisa tabela com parser numérico correto"""
+def rule_table_empty(table: Dict) -> Optional[Dict]:
+    """Regra 1: Tabela sem dados (apenas cabeçalho ou zeros)"""
+    rows = table["rows_raw"]
     
-    issues = []
-    table_name = table["nome"]
-    rows_raw = table["rows_raw"]
-    
-    if not rows_raw:
-        return issues
-    
-    # 1. Fonte
-    if not table["fonte"]:
-        issues.append({
+    if not rows:
+        return {
             "severity": "FAIL",
-            "table": table_name,
-            "issue": "Fonte não identificada",
-            "detail": "Procurado em tfoot, 5 elementos antes, 10 depois, classes comuns",
-            "recommendation": "Adicionar 'Fonte: [origem]'"
-        })
+            "table": table["nome"],
+            "rule": "table_empty",
+            "issue": "Tabela estruturada sem dados preenchidos",
+            "detail": "DataFrame vazio ou apenas cabeçalhos",
+            "recommendation": "Preencher dados na tabela"
+        }
     
-    # 2. Células vazias
-    total_cells = sum(len(row) for row in rows_raw)
-    empty_cells = sum(1 for row in rows_raw for cell in row if not cell.strip())
-    
-    if total_cells > 0 and (empty_cells / total_cells * 100) > 15:
-        issues.append({
-            "severity": "WARN",
-            "table": table_name,
-            "issue": f"{empty_cells/total_cells*100:.1f}% células vazias",
-            "detail": f"{empty_cells}/{total_cells}",
-            "recommendation": "Padronizar (0, ND, N/A)"
-        })
-    
-    # 3. Colunas inconsistentes
-    col_counts = [len(row) for row in rows_raw]
-    if len(set(col_counts)) > 1:
-        issues.append({
-            "severity": "FAIL",
-            "table": table_name,
-            "issue": f"Colunas inconsistentes: {min(col_counts)}-{max(col_counts)}",
-            "detail": str(col_counts),
-            "recommendation": "Verificar alinhamento"
-        })
-    
-    # 4. Soma (APENAS com Total explícito)
-    total_issue = check_soma(table_name, table["headers"], rows_raw)
-    if total_issue:
-        issues.append(total_issue)
-    
-    # 5. Formatação decimal
-    all_text = ' '.join([' '.join(row) for row in rows_raw])
-    comma_nums = len(re.findall(r'\d{1,3},\d{2,}', all_text))
-    dot_nums = len(re.findall(r'\d+\.\d+', all_text))
-    
-    if comma_nums > 0 and dot_nums > 5:
-        issues.append({
-            "severity": "WARN",
-            "table": table_name,
-            "issue": "Mistura de separadores",
-            "detail": f"{comma_nums} com vírgula, {dot_nums} com ponto",
-            "recommendation": "Padronizar"
-        })
-    
-    return issues
-
-def check_soma(table_name: str, headers: list, rows_raw: list) -> Optional[Dict]:
-    """Soma APENAS se houver 'Total' explícito. Usa parse_number_ptbr."""
-    
-    # Detectar coluna Total
-    total_col_idx = None
-    if headers:
-        for idx, h in enumerate(headers):
-            if 'Total' in h or 'total' in h.lower():
-                total_col_idx = idx
+    # Verificar se todas as células numéricas são zero
+    has_nonzero = False
+    for row in rows:
+        for cell in row:
+            num = parse_number_ptbr(cell)
+            if num is not None and num != 0:
+                has_nonzero = True
                 break
-    
-    # Detectar linha Total
-    total_row_idx = None
-    for idx, row in enumerate(rows_raw):
-        if row and ('Total' in row[0] or 'total' in row[0].lower()):
-            total_row_idx = idx
+        if has_nonzero:
             break
     
-    # Sem Total explícito = SKIP (não retornar erro)
-    if total_col_idx is None and total_row_idx is None:
+    if not has_nonzero:
+        return {
+            "severity": "FAIL",
+            "table": table["nome"],
+            "rule": "table_empty",
+            "issue": "Tabela com apenas zeros ou valores nulos",
+            "detail": "Todas as células numéricas contêm zero ou None",
+            "recommendation": "Verificar se dados estão faltando"
+        }
+    
+    return None
+
+def rule_table_without_data(table: Dict) -> Optional[Dict]:
+    """Regra 2: Tabela com categorias mas sem colunas numéricas"""
+    rows = table["rows_raw"]
+    
+    if not rows:
         return None
     
-    # Soma por coluna (se houver coluna Total)
-    if total_col_idx is not None:
-        for row_idx, row in enumerate(rows_raw):
-            if len(row) <= total_col_idx:
-                continue
-            
-            total_str = row[total_col_idx]
-            total_val = parse_number_ptbr(total_str)
-            
-            # Somar parciais
-            parciais = []
-            parciais_str = []
-            for col_idx in range(len(row)):
-                if col_idx != total_col_idx:
-                    num = parse_number_ptbr(row[col_idx])
-                    if num is not None:
-                        parciais.append(num)
-                        parciais_str.append(f"{row[col_idx]}({num})")
-            
-            if parciais and total_val is not None:
-                soma = sum(parciais)
-                tolerancia = 0.01 if isinstance(soma, float) or isinstance(total_val, float) else 0
-                
-                if abs(soma - total_val) > tolerancia:
-                    return {
-                        "severity": "FAIL",
-                        "table": table_name,
-                        "issue": f"Erro na soma (linha {row_idx+1})",
-                        "detail": f"Soma: {soma} | Total: {total_val} | Parciais: {', '.join(parciais_str[:3])}",
-                        "recommendation": "Recalcular o total"
-                    }
-    
-    # Soma por linha (se houver linha Total)
-    if total_row_idx is not None and total_col_idx is None:
-        total_row = rows_raw[total_row_idx]
-        
-        for col_idx in range(1, len(total_row)):
-            total_str = total_row[col_idx]
-            total_val = parse_number_ptbr(total_str)
-            
-            if total_val is None:
-                continue
-            
-            parciais = []
-            parciais_str = []
-            for row_idx in range(len(rows_raw)):
-                if row_idx == total_row_idx or col_idx >= len(rows_raw[row_idx]):
-                    continue
-                
-                num = parse_number_ptbr(rows_raw[row_idx][col_idx])
+    # Verificar se há pelo menos uma coluna com números
+    has_numeric_column = False
+    for col_idx in range(len(rows[0])):
+        for row in rows:
+            if col_idx < len(row):
+                num = parse_number_ptbr(row[col_idx])
                 if num is not None:
-                    parciais.append(num)
-                    parciais_str.append(f"{rows_raw[row_idx][col_idx]}({num})")
+                    has_numeric_column = True
+                    break
+        if has_numeric_column:
+            break
+    
+    if not has_numeric_column:
+        return {
+            "severity": "FAIL",
+            "table": table["nome"],
+            "rule": "table_without_data",
+            "issue": "Tabela sem quantitativos",
+            "detail": "Linhas de categorias encontradas, mas nenhuma coluna numérica válida",
+            "recommendation": "Adicionar dados numéricos ou remover tabela vazia"
+        }
+    
+    return None
+
+def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
+    """Regra 4: Variação extrema ano-a-ano em séries históricas"""
+    rows = table["rows_raw"]
+    
+    if not rows or len(rows) < 3:
+        return None
+    
+    # Procurar por série temporal (ano em coluna)
+    # Assumindo estrutura: primeira linha = categorias, depois dados
+    # Procurar padrão de anos nos headers ou primeiros valores
+    
+    for col_idx in range(1, len(rows[0])):
+        values = []
+        for row_idx, row in enumerate(rows):
+            if col_idx < len(row):
+                num = parse_number_ptbr(row[col_idx])
+                if num is not None and num != 0:
+                    values.append((row_idx, num))
+        
+        # Se temos menos de 3 valores, pular
+        if len(values) < 3:
+            continue
+        
+        # Calcular variações
+        for i in range(len(values) - 1):
+            prev_val = values[i][1]
+            curr_val = values[i + 1][1]
             
-            if parciais:
-                soma = sum(parciais)
-                tolerancia = 0.01 if isinstance(soma, float) or isinstance(total_val, float) else 0
+            if prev_val > 0:
+                variacao_pct = ((curr_val - prev_val) / prev_val) * 100
                 
-                if abs(soma - total_val) > tolerancia:
+                if abs(variacao_pct) > 500:
                     return {
                         "severity": "FAIL",
-                        "table": table_name,
-                        "issue": f"Erro na soma (coluna {col_idx})",
-                        "detail": f"Soma: {soma} | Total: {total_val}",
-                        "recommendation": "Recalcular o total"
+                        "table": table["nome"],
+                        "rule": "extreme_year_variation",
+                        "issue": f"Variação extrema > 500% (col {col_idx})",
+                        "detail": f"Linha {values[i][0]+1}: {prev_val} → Linha {values[i+1][0]+1}: {curr_val} ({variacao_pct:.1f}%)",
+                        "recommendation": "Verificar integridade dos dados"
+                    }
+                elif abs(variacao_pct) > 300:
+                    return {
+                        "severity": "WARN",
+                        "table": table["nome"],
+                        "rule": "extreme_year_variation",
+                        "issue": f"Variação extrema 300-500% (col {col_idx})",
+                        "detail": f"Linha {values[i][0]+1}: {prev_val} → Linha {values[i+1][0]+1}: {curr_val} ({variacao_pct:.1f}%)",
+                        "recommendation": "Validar dados com fonte"
                     }
     
     return None
+
+def rule_extreme_growth_detection(table: Dict) -> Optional[Dict]:
+    """Regra 5: Crescimento > 300% entre anos"""
+    rows = table["rows_raw"]
+    
+    if not rows or len(rows) < 3:
+        return None
+    
+    for col_idx in range(1, len(rows[0])):
+        values = []
+        for row_idx, row in enumerate(rows):
+            if col_idx < len(row):
+                num = parse_number_ptbr(row[col_idx])
+                if num is not None and num > 0:
+                    values.append((row_idx, num))
+        
+        if len(values) < 2:
+            continue
+        
+        for i in range(len(values) - 1):
+            prev_val = values[i][1]
+            curr_val = values[i + 1][1]
+            
+            if prev_val > 0:
+                crescimento_pct = ((curr_val - prev_val) / prev_val) * 100
+                
+                if crescimento_pct > 300:
+                    return {
+                        "severity": "WARN",
+                        "table": table["nome"],
+                        "rule": "extreme_growth_detection",
+                        "issue": f"Crescimento extremo > 300%",
+                        "detail": f"Linha {values[i][0]+1}: {prev_val} → Linha {values[i+1][0]+1}: {curr_val} (+{crescimento_pct:.1f}%)",
+                        "recommendation": "Validar crescimento exponencial"
+                    }
+    
+    return None
+
+def rule_extreme_drop_detection(table: Dict) -> Optional[Dict]:
+    """Regra 6: Queda > 50% entre anos"""
+    rows = table["rows_raw"]
+    
+    if not rows or len(rows) < 3:
+        return None
+    
+    for col_idx in range(1, len(rows[0])):
+        values = []
+        for row_idx, row in enumerate(rows):
+            if col_idx < len(row):
+                num = parse_number_ptbr(row[col_idx])
+                if num is not None and num > 0:
+                    values.append((row_idx, num))
+        
+        if len(values) < 2:
+            continue
+        
+        for i in range(len(values) - 1):
+            prev_val = values[i][1]
+            curr_val = values[i + 1][1]
+            
+            if prev_val > 0:
+                queda_pct = ((prev_val - curr_val) / prev_val) * 100
+                
+                if queda_pct > 50:
+                    return {
+                        "severity": "WARN",
+                        "table": table["nome"],
+                        "rule": "extreme_drop_detection",
+                        "issue": f"Queda extrema > 50%",
+                        "detail": f"Linha {values[i][0]+1}: {prev_val} → Linha {values[i+1][0]+1}: {curr_val} (-{queda_pct:.1f}%)",
+                        "recommendation": "Verificar desativações ou alterações estruturais"
+                    }
+    
+    return None
+
+def rule_duplicated_category_structure(table: Dict) -> Optional[Dict]:
+    """Regra 7: Linhas com valores numéricos idênticos"""
+    rows = table["rows_raw"]
+    
+    if not rows or len(rows) < 2:
+        return None
+    
+    # Extrair apenas valores numéricos de cada linha
+    numeric_signatures = {}
+    for row_idx, row in enumerate(rows):
+        sig = tuple(parse_number_ptbr(cell) for cell in row)
+        
+        if sig in numeric_signatures:
+            prev_row_idx = numeric_signatures[sig]
+            return {
+                "severity": "WARN",
+                "table": table["nome"],
+                "rule": "duplicated_category_structure",
+                "issue": "Linhas com valores numéricos idênticos",
+                "detail": f"Linha {prev_row_idx+1} ({row[0]}) e Linha {row_idx+1} ({row[0]}) têm mesmos valores",
+                "recommendation": "Verificar se é duplicação ou categorias distintas"
+            }
+        
+        numeric_signatures[sig] = row_idx
+    
+    return None
+
+def rule_outdated_year_in_graph(html: str, base_year: int) -> Optional[Dict]:
+    """Regra 8: String de ano desatualizada em gráficos"""
+    # Procurar padrão "2023" sem contexto de série histórica
+    current_year = str(base_year + 1)
+    prev_year = str(base_year)
+    
+    # Se base_year=2024, procurar "2023" fora de padrões "2020 a 2023"
+    if base_year == 2024 and "2023" in html:
+        # Verificar se "2023" aparece isolado (não em série)
+        if not re.search(r'\d{4}\s+a\s+2023', html):
+            # Procurar em contexto gráfico
+            if re.search(r'[Gg]ráfico|[Cc]hart|svg|canvas', html):
+                return {
+                    "severity": "FAIL",
+                    "table": "Gráficos/Visualizações",
+                    "rule": "outdated_year_in_graph",
+                    "issue": f"Ano desatualizado {prev_year} em visualização",
+                    "detail": f"Encontrado '{prev_year}' em contexto gráfico (base_year={base_year})",
+                    "recommendation": f"Atualizar gráficos para {current_year}"
+                }
+    
+    return None
+
+def rule_thousand_separator_inconsistency(html: str) -> Optional[Dict]:
+    """Regra 9: Mistura de separadores de milhar"""
+    # Procurar por 1290 e 1.290 simultaneamente
+    has_no_sep = bool(re.search(r'\b\d{4,}(?!\.\d)', html))  # 1290 sem ponto
+    has_dot_sep = bool(re.search(r'\d{1,3}\.\d{3}', html))   # 1.290
+    
+    if has_no_sep and has_dot_sep:
+        return {
+            "severity": "WARN",
+            "table": "Documento",
+            "rule": "thousand_separator_inconsistency",
+            "issue": "Inconsistência de separador de milhar",
+            "detail": "Encontrados números como '1290' e '1.290' simultaneamente",
+            "recommendation": "Padronizar separador (usar 1.290 ou 1290 consistentemente)"
+        }
+    
+    return None
+
+def rule_spelling_error_detection(html: str) -> Optional[Dict]:
+    """Regra 10: Erros de digitação comuns"""
+    # Detectar "Regulamente Instituído" (deveria ser "Regularmente")
+    if "Regulamente" in html or "regulamente" in html:
+        return {
+            "severity": "WARN",
+            "table": "Documento",
+            "rule": "spelling_error_detection",
+            "issue": "Erro de ortografia detectado",
+            "detail": "Encontrado 'Regulamente' (correto: 'Regularmente')",
+            "recommendation": "Corrigir ortografia"
+        }
+    
+    return None
+
+def rule_encoding_error(html: str) -> Optional[Dict]:
+    """Regra 11: Caracteres de encoding inválido"""
+    # Detectar caracteres corrompidos comuns
+    invalid_chars = [' ', '?', '\ufffd', '\x00']
+    
+    for char in invalid_chars:
+        if char in html:
+            return {
+                "severity": "WARN",
+                "table": "Documento",
+                "rule": "encoding_error",
+                "issue": "Caractere inválido detectado",
+                "detail": f"Encontrado caractere corrompido: '{repr(char)}'",
+                "recommendation": "Verificar encoding (UTF-8) do arquivo"
+            }
+    
+    return None
+
+# ===== ANÁLISE DE TABELAS =====
+
+def analyze_table(table: Dict, html: str, base_year: int) -> List[Dict]:
+    """Analisa tabela com todas as regras"""
+    
+    issues = []
+    
+    # Regra 1: Tabela vazia
+    issue = rule_table_empty(table)
+    if issue:
+        issues.append(issue)
+        return issues  # Se vazia, não fazer outras análises
+    
+    # Regra 2: Tabela sem dados
+    issue = rule_table_without_data(table)
+    if issue:
+        issues.append(issue)
+        return issues
+    
+    # Regra 4: Variação extrema
+    issue = rule_extreme_year_variation(table)
+    if issue:
+        issues.append(issue)
+    
+    # Regra 5: Crescimento extremo
+    issue = rule_extreme_growth_detection(table)
+    if issue:
+        issues.append(issue)
+    
+    # Regra 6: Queda extrema
+    issue = rule_extreme_drop_detection(table)
+    if issue:
+        issues.append(issue)
+    
+    # Regra 7: Estrutura duplicada
+    issue = rule_duplicated_category_structure(table)
+    if issue:
+        issues.append(issue)
+    
+    return issues
+
+def analyze_document(html: str, base_year: int) -> List[Dict]:
+    """Análises a nível de documento/capítulo"""
+    
+    issues = []
+    
+    # Regra 8: Ano desatualizado em gráfico
+    issue = rule_outdated_year_in_graph(html, base_year)
+    if issue:
+        issues.append(issue)
+    
+    # Regra 9: Inconsistência de separador
+    issue = rule_thousand_separator_inconsistency(html)
+    if issue:
+        issues.append(issue)
+    
+    # Regra 10: Erro de ortografia
+    issue = rule_spelling_error_detection(html)
+    if issue:
+        issues.append(issue)
+    
+    # Regra 11: Erro de encoding
+    issue = rule_encoding_error(html)
+    if issue:
+        issues.append(issue)
+    
+    return issues
 
 # ===== CHECKS GLOBAIS =====
 
@@ -355,6 +547,7 @@ def check_year(html: str, report_year: int) -> List[Dict]:
         issues.append({
             "severity": "FAIL",
             "table": "Metadados",
+            "rule": "year_check",
             "issue": f"Ano {year_str} não encontrado",
             "detail": "Não aparece em captions/títulos",
             "recommendation": f"Adicionar '{year_str}'"
@@ -365,7 +558,7 @@ def check_year(html: str, report_year: int) -> List[Dict]:
 # ===== MAIN =====
 
 def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
-    """Auditoria completa"""
+    """Auditoria completa com novas regras"""
     issues = []
     
     html, diag = download_page(url)
@@ -374,6 +567,7 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
         issues.append({
             "severity": "FAIL",
             "table": "Documento",
+            "rule": "document_structure",
             "issue": "Nenhuma tabela encontrada",
             "detail": f"{diag['tamanho_html_kb']:.1f} KB",
             "recommendation": "Verificar renderização"
@@ -383,16 +577,22 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
     issues.append({
         "severity": "PASS",
         "table": "Documento",
+        "rule": "document_structure",
         "issue": f"✓ {diag['contagem_tables']} tabela(s)",
         "detail": f"{diag['tamanho_html_kb']:.1f} KB",
         "recommendation": "Analisando..."
     })
     
+    # Análises de documento
+    issues.extend(analyze_document(html, base_year))
+    
+    # Extração e análise de tabelas
     tables = extract_tables_from_html(html)
     
     for table in tables:
-        issues.extend(analyze_table(table))
+        issues.extend(analyze_table(table, html, base_year))
     
+    # Checks globais
     issues.extend(check_year(html, report_year))
     
     return issues
@@ -407,12 +607,7 @@ HTML = """<!DOCTYPE html>
     <title>Auditoria UnB</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #003366 0%, #2E1D86 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #003366 0%, #2E1D86 100%); min-height: 100vh; padding: 20px; }
         .container { background: white; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.2); max-width: 1000px; margin: 0 auto; padding: 40px; }
         h1 { color: #003366; margin-bottom: 10px; }
         .subtitle { color: #666; margin-bottom: 30px; font-size: 14px; }
@@ -436,12 +631,13 @@ HTML = """<!DOCTYPE html>
         .badge-pass { background: #4caf50; }
         .badge-warn { background: #ff9800; }
         .badge-fail { background: #f44336; }
+        .rule-tag { display: inline-block; padding: 2px 8px; background: #f0f0f0; border-radius: 3px; font-size: 11px; margin-top: 8px; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>📋 Auditoria - Anuário UnB</h1>
-        <p class="subtitle">Análise de qualidade e consistência de dados</p>
+        <p class="subtitle">Análise de qualidade, consistência e regras específicas Capítulo 9</p>
 
         <div id="form">
             <div class="form-group">
@@ -520,6 +716,7 @@ HTML = """<!DOCTYPE html>
                     <div style="color: #333; font-weight: 500; margin-bottom: 8px;">${i.issue}</div>
                     <div style="color: #555; font-size: 14px; margin-bottom: 10px;">${i.detail}</div>
                     <div style="color: #666; font-style: italic; font-size: 13px; padding: 10px; background: rgba(0,0,0,0.03); border-radius: 4px;">💡 ${i.recommendation}</div>
+                    <div class="rule-tag">Regra: ${i.rule}</div>
                 </div>
             `).join('');
 
