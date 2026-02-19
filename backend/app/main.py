@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import requests
 from bs4 import BeautifulSoup
 import re
 from typing import List, Dict, Tuple, Optional, Any
-from collections import defaultdict
+from datetime import datetime
+import io
 
 app = FastAPI(title="Auditoria Anuário UnB")
 
@@ -174,7 +175,7 @@ def find_fonte_ampliado(table_elem, soup) -> str:
 # ===== NOVAS REGRAS DO CAPÍTULO 9 =====
 
 def rule_table_empty(table: Dict) -> Optional[Dict]:
-    """Regra 1: Tabela sem dados (apenas cabeçalho ou zeros)"""
+    """Regra 1: Tabela sem dados"""
     rows = table["rows_raw"]
     
     if not rows:
@@ -187,7 +188,6 @@ def rule_table_empty(table: Dict) -> Optional[Dict]:
             "recommendation": "Preencher dados na tabela"
         }
     
-    # Verificar se todas as células numéricas são zero
     has_nonzero = False
     for row in rows:
         for cell in row:
@@ -211,13 +211,12 @@ def rule_table_empty(table: Dict) -> Optional[Dict]:
     return None
 
 def rule_table_without_data(table: Dict) -> Optional[Dict]:
-    """Regra 2: Tabela com categorias mas sem colunas numéricas"""
+    """Regra 2: Tabela sem colunas numéricas"""
     rows = table["rows_raw"]
     
     if not rows:
         return None
     
-    # Verificar se há pelo menos uma coluna com números
     has_numeric_column = False
     for col_idx in range(len(rows[0])):
         for row in rows:
@@ -242,15 +241,11 @@ def rule_table_without_data(table: Dict) -> Optional[Dict]:
     return None
 
 def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
-    """Regra 4: Variação extrema ano-a-ano em séries históricas"""
+    """Regra 4: Variação extrema ano-a-ano"""
     rows = table["rows_raw"]
     
     if not rows or len(rows) < 3:
         return None
-    
-    # Procurar por série temporal (ano em coluna)
-    # Assumindo estrutura: primeira linha = categorias, depois dados
-    # Procurar padrão de anos nos headers ou primeiros valores
     
     for col_idx in range(1, len(rows[0])):
         values = []
@@ -260,11 +255,9 @@ def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
                 if num is not None and num != 0:
                     values.append((row_idx, num))
         
-        # Se temos menos de 3 valores, pular
         if len(values) < 3:
             continue
         
-        # Calcular variações
         for i in range(len(values) - 1):
             prev_val = values[i][1]
             curr_val = values[i + 1][1]
@@ -293,88 +286,13 @@ def rule_extreme_year_variation(table: Dict) -> Optional[Dict]:
     
     return None
 
-def rule_extreme_growth_detection(table: Dict) -> Optional[Dict]:
-    """Regra 5: Crescimento > 300% entre anos"""
-    rows = table["rows_raw"]
-    
-    if not rows or len(rows) < 3:
-        return None
-    
-    for col_idx in range(1, len(rows[0])):
-        values = []
-        for row_idx, row in enumerate(rows):
-            if col_idx < len(row):
-                num = parse_number_ptbr(row[col_idx])
-                if num is not None and num > 0:
-                    values.append((row_idx, num))
-        
-        if len(values) < 2:
-            continue
-        
-        for i in range(len(values) - 1):
-            prev_val = values[i][1]
-            curr_val = values[i + 1][1]
-            
-            if prev_val > 0:
-                crescimento_pct = ((curr_val - prev_val) / prev_val) * 100
-                
-                if crescimento_pct > 300:
-                    return {
-                        "severity": "WARN",
-                        "table": table["nome"],
-                        "rule": "extreme_growth_detection",
-                        "issue": f"Crescimento extremo > 300%",
-                        "detail": f"Linha {values[i][0]+1}: {prev_val} → Linha {values[i+1][0]+1}: {curr_val} (+{crescimento_pct:.1f}%)",
-                        "recommendation": "Validar crescimento exponencial"
-                    }
-    
-    return None
-
-def rule_extreme_drop_detection(table: Dict) -> Optional[Dict]:
-    """Regra 6: Queda > 50% entre anos"""
-    rows = table["rows_raw"]
-    
-    if not rows or len(rows) < 3:
-        return None
-    
-    for col_idx in range(1, len(rows[0])):
-        values = []
-        for row_idx, row in enumerate(rows):
-            if col_idx < len(row):
-                num = parse_number_ptbr(row[col_idx])
-                if num is not None and num > 0:
-                    values.append((row_idx, num))
-        
-        if len(values) < 2:
-            continue
-        
-        for i in range(len(values) - 1):
-            prev_val = values[i][1]
-            curr_val = values[i + 1][1]
-            
-            if prev_val > 0:
-                queda_pct = ((prev_val - curr_val) / prev_val) * 100
-                
-                if queda_pct > 50:
-                    return {
-                        "severity": "WARN",
-                        "table": table["nome"],
-                        "rule": "extreme_drop_detection",
-                        "issue": f"Queda extrema > 50%",
-                        "detail": f"Linha {values[i][0]+1}: {prev_val} → Linha {values[i+1][0]+1}: {curr_val} (-{queda_pct:.1f}%)",
-                        "recommendation": "Verificar desativações ou alterações estruturais"
-                    }
-    
-    return None
-
 def rule_duplicated_category_structure(table: Dict) -> Optional[Dict]:
-    """Regra 7: Linhas com valores numéricos idênticos"""
+    """Regra 6: Linhas com valores idênticos"""
     rows = table["rows_raw"]
     
     if not rows or len(rows) < 2:
         return None
     
-    # Extrair apenas valores numéricos de cada linha
     numeric_signatures = {}
     for row_idx, row in enumerate(rows):
         sig = tuple(parse_number_ptbr(cell) for cell in row)
@@ -394,34 +312,10 @@ def rule_duplicated_category_structure(table: Dict) -> Optional[Dict]:
     
     return None
 
-def rule_outdated_year_in_graph(html: str, base_year: int) -> Optional[Dict]:
-    """Regra 8: String de ano desatualizada em gráficos"""
-    # Procurar padrão "2023" sem contexto de série histórica
-    current_year = str(base_year + 1)
-    prev_year = str(base_year)
-    
-    # Se base_year=2024, procurar "2023" fora de padrões "2020 a 2023"
-    if base_year == 2024 and "2023" in html:
-        # Verificar se "2023" aparece isolado (não em série)
-        if not re.search(r'\d{4}\s+a\s+2023', html):
-            # Procurar em contexto gráfico
-            if re.search(r'[Gg]ráfico|[Cc]hart|svg|canvas', html):
-                return {
-                    "severity": "FAIL",
-                    "table": "Gráficos/Visualizações",
-                    "rule": "outdated_year_in_graph",
-                    "issue": f"Ano desatualizado {prev_year} em visualização",
-                    "detail": f"Encontrado '{prev_year}' em contexto gráfico (base_year={base_year})",
-                    "recommendation": f"Atualizar gráficos para {current_year}"
-                }
-    
-    return None
-
 def rule_thousand_separator_inconsistency(html: str) -> Optional[Dict]:
-    """Regra 9: Mistura de separadores de milhar"""
-    # Procurar por 1290 e 1.290 simultaneamente
-    has_no_sep = bool(re.search(r'\b\d{4,}(?!\.\d)', html))  # 1290 sem ponto
-    has_dot_sep = bool(re.search(r'\d{1,3}\.\d{3}', html))   # 1.290
+    """Regra 8: Mistura de separadores"""
+    has_no_sep = bool(re.search(r'\b\d{4,}(?!\.\d)', html))
+    has_dot_sep = bool(re.search(r'\d{1,3}\.\d{3}', html))
     
     if has_no_sep and has_dot_sep:
         return {
@@ -436,8 +330,7 @@ def rule_thousand_separator_inconsistency(html: str) -> Optional[Dict]:
     return None
 
 def rule_spelling_error_detection(html: str) -> Optional[Dict]:
-    """Regra 10: Erros de digitação comuns"""
-    # Detectar "Regulamente Instituído" (deveria ser "Regularmente")
+    """Regra 9: Erros de ortografia"""
     if "Regulamente" in html or "regulamente" in html:
         return {
             "severity": "WARN",
@@ -450,59 +343,27 @@ def rule_spelling_error_detection(html: str) -> Optional[Dict]:
     
     return None
 
-def rule_encoding_error(html: str) -> Optional[Dict]:
-    """Regra 11: Caracteres de encoding inválido"""
-    # Detectar caracteres corrompidos comuns
-    invalid_chars = [' ', '?', '\ufffd', '\x00']
-    
-    for char in invalid_chars:
-        if char in html:
-            return {
-                "severity": "WARN",
-                "table": "Documento",
-                "rule": "encoding_error",
-                "issue": "Caractere inválido detectado",
-                "detail": f"Encontrado caractere corrompido: '{repr(char)}'",
-                "recommendation": "Verificar encoding (UTF-8) do arquivo"
-            }
-    
-    return None
-
-# ===== ANÁLISE DE TABELAS =====
+# ===== ANÁLISE E EXPORT =====
 
 def analyze_table(table: Dict, html: str, base_year: int) -> List[Dict]:
     """Analisa tabela com todas as regras"""
     
     issues = []
     
-    # Regra 1: Tabela vazia
     issue = rule_table_empty(table)
     if issue:
         issues.append(issue)
-        return issues  # Se vazia, não fazer outras análises
+        return issues
     
-    # Regra 2: Tabela sem dados
     issue = rule_table_without_data(table)
     if issue:
         issues.append(issue)
         return issues
     
-    # Regra 4: Variação extrema
     issue = rule_extreme_year_variation(table)
     if issue:
         issues.append(issue)
     
-    # Regra 5: Crescimento extremo
-    issue = rule_extreme_growth_detection(table)
-    if issue:
-        issues.append(issue)
-    
-    # Regra 6: Queda extrema
-    issue = rule_extreme_drop_detection(table)
-    if issue:
-        issues.append(issue)
-    
-    # Regra 7: Estrutura duplicada
     issue = rule_duplicated_category_structure(table)
     if issue:
         issues.append(issue)
@@ -510,33 +371,19 @@ def analyze_table(table: Dict, html: str, base_year: int) -> List[Dict]:
     return issues
 
 def analyze_document(html: str, base_year: int) -> List[Dict]:
-    """Análises a nível de documento/capítulo"""
+    """Análises a nível de documento"""
     
     issues = []
     
-    # Regra 8: Ano desatualizado em gráfico
-    issue = rule_outdated_year_in_graph(html, base_year)
-    if issue:
-        issues.append(issue)
-    
-    # Regra 9: Inconsistência de separador
     issue = rule_thousand_separator_inconsistency(html)
     if issue:
         issues.append(issue)
     
-    # Regra 10: Erro de ortografia
     issue = rule_spelling_error_detection(html)
     if issue:
         issues.append(issue)
     
-    # Regra 11: Erro de encoding
-    issue = rule_encoding_error(html)
-    if issue:
-        issues.append(issue)
-    
     return issues
-
-# ===== CHECKS GLOBAIS =====
 
 def check_year(html: str, report_year: int) -> List[Dict]:
     """Verifica anos"""
@@ -555,10 +402,8 @@ def check_year(html: str, report_year: int) -> List[Dict]:
     
     return issues
 
-# ===== MAIN =====
-
 def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
-    """Auditoria completa com novas regras"""
+    """Auditoria completa"""
     issues = []
     
     html, diag = download_page(url)
@@ -583,19 +428,89 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
         "recommendation": "Analisando..."
     })
     
-    # Análises de documento
     issues.extend(analyze_document(html, base_year))
     
-    # Extração e análise de tabelas
     tables = extract_tables_from_html(html)
     
     for table in tables:
         issues.extend(analyze_table(table, html, base_year))
     
-    # Checks globais
     issues.extend(check_year(html, report_year))
     
     return issues
+
+def generate_txt_report(issues: List[Dict], url: str, report_year: int) -> str:
+    """Gera relatório TXT formatado"""
+    
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    
+    txt = "=" * 80 + "\n"
+    txt += "AUDITORIA DO ANUÁRIO ESTATÍSTICO UnB\n"
+    txt += "=" * 80 + "\n\n"
+    
+    txt += f"Data: {now}\n"
+    txt += f"URL: {url}\n"
+    txt += f"Ano: {report_year}\n"
+    txt += "\n"
+    
+    # Agrupar por severity
+    fail_issues = [i for i in issues if i["severity"] == "FAIL"]
+    warn_issues = [i for i in issues if i["severity"] == "WARN"]
+    pass_issues = [i for i in issues if i["severity"] == "PASS"]
+    
+    # Resumo
+    txt += "-" * 80 + "\n"
+    txt += "RESUMO\n"
+    txt += "-" * 80 + "\n"
+    txt += f"Erros Críticos (FAIL):    {len(fail_issues)}\n"
+    txt += f"Avisos (WARN):            {len(warn_issues)}\n"
+    txt += f"OK (PASS):                {len(pass_issues)}\n"
+    txt += "\n\n"
+    
+    # Erros críticos
+    if fail_issues:
+        txt += "=" * 80 + "\n"
+        txt += "❌ ERROS CRÍTICOS (FAIL)\n"
+        txt += "=" * 80 + "\n\n"
+        
+        for idx, issue in enumerate(fail_issues, 1):
+            txt += f"{idx}. {issue['issue']}\n"
+            txt += f"   Tabela: {issue['table']}\n"
+            txt += f"   Regra: {issue['rule']}\n"
+            txt += f"   Detalhe: {issue['detail']}\n"
+            txt += f"   Ação: {issue['recommendation']}\n"
+            txt += "\n"
+    
+    # Avisos
+    if warn_issues:
+        txt += "=" * 80 + "\n"
+        txt += "⚠️  AVISOS (WARN)\n"
+        txt += "=" * 80 + "\n\n"
+        
+        for idx, issue in enumerate(warn_issues, 1):
+            txt += f"{idx}. {issue['issue']}\n"
+            txt += f"   Tabela: {issue['table']}\n"
+            txt += f"   Regra: {issue['rule']}\n"
+            txt += f"   Detalhe: {issue['detail']}\n"
+            txt += f"   Ação: {issue['recommendation']}\n"
+            txt += "\n"
+    
+    # OK
+    if pass_issues:
+        txt += "=" * 80 + "\n"
+        txt += "✓ TUDO OK (PASS)\n"
+        txt += "=" * 80 + "\n\n"
+        
+        for idx, issue in enumerate(pass_issues, 1):
+            txt += f"{idx}. {issue['issue']}\n"
+            txt += f"   {issue['detail']}\n"
+            txt += "\n"
+    
+    txt += "\n" + "=" * 80 + "\n"
+    txt += "FIM DO RELATÓRIO\n"
+    txt += "=" * 80 + "\n"
+    
+    return txt
 
 # ===== API =====
 
@@ -615,7 +530,10 @@ HTML = """<!DOCTYPE html>
         label { display: block; color: #003366; font-weight: 600; margin-bottom: 8px; }
         input { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 6px; }
         .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
-        button { width: 100%; padding: 12px; background: linear-gradient(135deg, #003366 0%, #2E1D86 100%); color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; margin-top: 20px; }
+        .button-group { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 20px; }
+        button { padding: 12px; background: linear-gradient(135deg, #003366 0%, #2E1D86 100%); color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; }
+        button:hover { opacity: 0.9; }
+        button.secondary { background: #666; }
         #loading { display: none; text-align: center; padding: 20px; }
         .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #003366; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 15px; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
@@ -632,6 +550,8 @@ HTML = """<!DOCTYPE html>
         .badge-warn { background: #ff9800; }
         .badge-fail { background: #f44336; }
         .rule-tag { display: inline-block; padding: 2px 8px; background: #f0f0f0; border-radius: 3px; font-size: 11px; margin-top: 8px; }
+        .export-button { background: #27ae60; margin-top: 20px; }
+        .export-button:hover { opacity: 0.9; }
     </style>
 </head>
 <body>
@@ -654,7 +574,9 @@ HTML = """<!DOCTYPE html>
                     <input type="number" id="baseYear" value="2024">
                 </div>
             </div>
-            <button onclick="audit()">🔍 Executar Auditoria</button>
+            <div class="button-group">
+                <button onclick="audit()">🔍 Executar Auditoria</button>
+            </div>
         </div>
 
         <div id="loading">
@@ -666,14 +588,22 @@ HTML = """<!DOCTYPE html>
             <div class="stats" id="stats"></div>
             <h2 style="color: #003366; margin-bottom: 20px;">Discrepâncias que merecem atenção:</h2>
             <div id="content"></div>
+            <button class="export-button" onclick="downloadReport()">📥 Baixar Relatório (TXT)</button>
         </div>
     </div>
 
     <script>
+        let lastIssues = [];
+        let lastUrl = '';
+        let lastYear = 2025;
+
         async function audit() {
             const url = document.getElementById('url').value;
             const year = parseInt(document.getElementById('year').value);
             const base = parseInt(document.getElementById('baseYear').value);
+
+            lastUrl = url;
+            lastYear = year;
 
             document.getElementById('form').style.display = 'none';
             document.getElementById('loading').style.display = 'block';
@@ -686,6 +616,7 @@ HTML = """<!DOCTYPE html>
                 });
 
                 const data = await res.json();
+                lastIssues = data.issues;
                 showResults(data.issues);
             } catch (e) {
                 alert('Erro: ' + e.message);
@@ -723,6 +654,31 @@ HTML = """<!DOCTYPE html>
             document.getElementById('loading').style.display = 'none';
             document.getElementById('results').style.display = 'block';
         }
+
+        function downloadReport() {
+            // Gerar TXT e fazer download
+            fetch('https://revisor-anuario-2.onrender.com/export/txt', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    issues: lastIssues,
+                    url: lastUrl,
+                    report_year: lastYear
+                })
+            })
+            .then(res => res.blob())
+            .then(blob => {
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `auditoria-anuario-${new Date().getTime()}.txt`;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                a.remove();
+            })
+            .catch(e => alert('Erro ao baixar: ' + e.message));
+        }
     </script>
 </body>
 </html>"""
@@ -736,6 +692,27 @@ def audit(req: AuditRequest):
     try:
         issues = run_audit(req.url, req.report_year, req.base_year)
         return {"status": "ok", "issues": issues}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/export/txt")
+def export_txt(data: dict):
+    """Gera e retorna arquivo TXT com o relatório"""
+    try:
+        txt_content = generate_txt_report(
+            data.get("issues", []),
+            data.get("url", ""),
+            data.get("report_year", 2025)
+        )
+        
+        # Converter para bytes
+        txt_bytes = txt_content.encode('utf-8')
+        
+        return StreamingResponse(
+            iter([txt_bytes]),
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename=auditoria-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"}
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
