@@ -9,14 +9,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Auditoria Anuário UnB")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class AuditRequest(BaseModel):
     url: str
@@ -73,11 +66,7 @@ def download_page(url: str) -> Tuple[str, Dict]:
         html = resp.text
         soup = BeautifulSoup(html, "html.parser")
         tables = soup.find_all("table")
-        return html, {
-            "tamanho_html_kb": len(html) / 1024,
-            "contagem_tables": len(tables),
-            "status": "OK",
-        }
+        return html, {"tamanho_html_kb": len(html) / 1024, "contagem_tables": len(tables), "status": "OK"}
     except Exception as e:
         return "", {"tamanho_html_kb": 0, "contagem_tables": 0, "status": f"ERRO: {str(e)}"}
 
@@ -99,155 +88,201 @@ def extract_tables_from_html(html: str) -> List[Dict]:
             cells = [normalize_text(td.get_text(" ", strip=True)) for td in tds]
             if any(c != "" for c in cells):
                 rows_raw.append(cells)
-        around_text = []
-        sib = table_elem
-        for _ in range(8):
-            sib = sib.find_next_sibling()
-            if not sib:
-                break
-            txt = normalize_text(sib.get_text(" ", strip=True))
-            if txt:
-                around_text.append(txt)
-        tables.append({
-            "numero": table_idx,
-            "nome": table_name,
-            "headers": headers,
-            "rows_raw": rows_raw,
-            "html": str(table_elem),
-            "around_text": around_text,
-        })
+        tables.append({"numero": table_idx, "nome": table_name, "headers": headers, "rows_raw": rows_raw, "html": str(table_elem)})
     return tables
 
 # ============================================================
-# REGRAS ESPECÍFICAS
+# REGRAS ESPECÍFICAS PARA ERROS DO CAPÍTULO 2
 # ============================================================
 
-def rule_blank_cells(table: Dict) -> Optional[Dict]:
-    """Apontar células em branco"""
+def rule_missing_digit_in_number(table: Dict) -> Optional[Dict]:
+    """Detecta erro de digitação: número que parece estar faltando dígito (ex: 1031 vs 10031)"""
     rows = table.get("rows_raw", [])
     if not rows:
         return None
-    blanks = []
-    for r_i, row in enumerate(rows, 1):
-        for c_i, cell in enumerate(row, 1):
-            if normalize_text(cell) == "":
-                blanks.append((r_i, c_i))
-                if len(blanks) >= 10:
-                    break
-        if len(blanks) >= 10:
-            break
-    if blanks:
-        return {
-            "severity": "WARN",
-            "table": table["nome"],
-            "rule": "blank_cells",
-            "issue": "Células em branco detectadas",
-            "detail": f"Exemplos: {', '.join([f'(L{r},C{c})' for r,c in blanks[:8]])}",
-            "recommendation": "Preencher ou justificar campos vazios."
-        }
+    
+    for r_i, row in enumerate(rows):
+        for c_i, cell in enumerate(row):
+            num = parse_number_ptbr(cell)
+            if num is None or not isinstance(num, int) or num < 100:
+                continue
+            
+            # Procurar se 10x deste número existe na mesma tabela
+            for other_row in rows:
+                for other_cell in other_row:
+                    other_num = parse_number_ptbr(other_cell)
+                    if other_num and isinstance(other_num, int):
+                        # Se um número é exatamente 10x o outro, suspeita de dígito faltante
+                        if other_num == num * 10 and 1000 <= num <= 2000:
+                            return {
+                                "severity": "FAIL",
+                                "table": table["nome"],
+                                "rule": "missing_digit",
+                                "issue": "Possível erro de digitação (dígito faltante)",
+                                "detail": f"Valor '{num}' pode ser '{int(num*10)}' (10x maior aparece na tabela)",
+                                "recommendation": "Verificar se número não tem dígito faltante."
+                            }
     return None
 
-def rule_year_2024_check(table: Dict, base_year: int) -> Optional[Dict]:
-    """Verificar se tabela/gráfico tem dados de 2024 e não de anos anteriores"""
-    name = normalize_text(table.get("nome", ""))
+def rule_identical_values_different_periods(table: Dict) -> Optional[Dict]:
+    """Detecta valores idênticos em períodos/anos diferentes (suspeitamente igual)"""
+    rows = table.get("rows_raw", [])
     headers = [normalize_text(h) for h in table.get("headers", [])]
-    body_text = " ".join([name] + headers)
     
-    years = set(re.findall(r'\b(20\d{2})\b', body_text))
-    if not years:
+    if len(rows) < 2:
         return None
     
-    # Se tem 2024, OK
-    if str(base_year) in years:
-        # Mas se tem TAMBÉM 2023/2022 sem ser série, alertar
-        prev_years = [y for y in years if int(y) < base_year]
-        if prev_years and len(years) == len(prev_years) + 1:
-            # Série de tempo OK
-            return None
-        elif prev_years:
-            return {
-                "severity": "WARN",
-                "table": table["nome"],
-                "rule": "outdated_data_alongside_2024",
-                "issue": "Dados de anos anteriores aparecem junto a 2024",
-                "detail": f"Anos detectados: {', '.join(sorted(years))}",
-                "recommendation": "Confirmar se deve incluir anos anteriores ou usar apenas 2024."
-            }
+    # Procurar por colunas de anos/períodos
+    year_cols = []
+    for col_idx, header in enumerate(headers):
+        if re.match(r'^20\d{2}$', header) or 'ano' in header.lower():
+            year_cols.append((col_idx, header))
+    
+    if len(year_cols) < 2:
         return None
     
-    # Se não tem 2024, FAIL
-    if years:
-        return {
-            "severity": "FAIL",
-            "table": table["nome"],
-            "rule": "missing_current_year",
-            "issue": f"Ano-base {base_year} não encontrado",
-            "detail": f"Anos detectados: {', '.join(sorted(years))}",
-            "recommendation": f"Atualizar tabela/gráfico com dados de {base_year}."
-        }
+    for row_idx, row in enumerate(rows):
+        values_by_period = []
+        for col_idx, period in year_cols:
+            if col_idx < len(row):
+                v = parse_number_ptbr(row[col_idx])
+                if v is not None:
+                    values_by_period.append((period, v, col_idx))
+        
+        # Se valores são idênticos em períodos diferentes
+        if len(values_by_period) >= 2:
+            for i in range(len(values_by_period) - 1):
+                if values_by_period[i][1] == values_by_period[i+1][1]:
+                    return {
+                        "severity": "WARN",
+                        "table": table["nome"],
+                        "rule": "duplicate_period_values",
+                        "issue": "Valores idênticos em períodos diferentes",
+                        "detail": f"'{row[0]}': {values_by_period[i][0]}={values_by_period[i][1]:.0f} = {values_by_period[i+1][0]}={values_by_period[i+1][1]:.0f}",
+                        "recommendation": "Verificar se dados foram copiados ou realmente são iguais."
+                    }
+    
     return None
 
-def rule_thousand_separator_consistency(table: Dict) -> Optional[Dict]:
-    """Apontar inconsistência de separador de milhar (dentro da mesma tabela)"""
+def rule_missing_field_standardized_table(table: Dict) -> Optional[Dict]:
+    """Detecta campo ausente em tabela estruturada (ex: Campus Ceilândia sem Área Total)"""
     rows = table.get("rows_raw", [])
-    if not rows:
+    
+    if len(rows) < 3:
         return None
     
-    has_sep = 0  # com ponto (1.234)
-    no_sep = 0   # sem ponto (1234)
+    col_counts = [len(row) for row in rows]
+    max_cols = max(col_counts)
     
-    for row in rows[:60]:
-        for cell in row:
-            c = normalize_text(cell)
-            if re.match(r'^\d{1,3}(\.\d{3})+$', c):
-                has_sep += 1
-            elif re.match(r'^\d{4,}$', c):
-                no_sep += 1
+    # Procurar linha com coluna faltante
+    for row_idx, row in enumerate(rows):
+        if len(row) < max_cols and len(row) > 1:
+            # Verificar se outras linhas têm dados naquele índice
+            has_data = any(parse_number_ptbr(row[i]) is not None for i in range(len(row)))
+            if has_data:
+                return {
+                    "severity": "WARN",
+                    "table": table["nome"],
+                    "rule": "missing_field",
+                    "issue": f"Campo ausente em linha estruturada (linha {row_idx+1})",
+                    "detail": f"'{row[0]}' tem {len(row)} colunas, esperado {max_cols}",
+                    "recommendation": "Preenc her campo faltante ou verificar formatação."
+                }
     
-    if has_sep > 0 and no_sep > 5:
-        return {
-            "severity": "WARN",
-            "table": table["nome"],
-            "rule": "thousand_separator_inconsistency",
-            "issue": "Separador de milhar inconsistente na tabela",
-            "detail": f"Alguns números com ponto (1.234) e outros sem (1234)",
-            "recommendation": "Padronizar: sempre usar separador de milhar (1.234) ou nunca usar."
-        }
     return None
 
-def rule_table_all_zero(table: Dict) -> Optional[Dict]:
-    """Tabelas integralmente zeradas"""
+def rule_disproportionate_distribution(table: Dict) -> Optional[Dict]:
+    """Detecta distribuição muito desproporcional entre colunas (ex: Enem 4 vs 2205)"""
     rows = table.get("rows_raw", [])
-    if not rows:
+    headers = [normalize_text(h) for h in table.get("headers", [])]
+    
+    if len(rows) < 2:
         return None
     
-    has_nonzero = False
+    # Procurar por padrão "1º Sem" e "2º Sem"
+    col_1sem = None
+    col_2sem = None
+    for idx, h in enumerate(headers):
+        if '1º' in h or 'i semestre' in h.lower():
+            col_1sem = idx
+        if '2º' in h or 'ii semestre' in h.lower():
+            col_2sem = idx
+    
+    if col_1sem is None or col_2sem is None:
+        return None
+    
     for row in rows:
-        for cell in row[1:]:
-            v = parse_number_ptbr(cell)
-            if v is not None and v != 0:
-                has_nonzero = True
-                break
-        if has_nonzero:
-            break
+        if col_1sem < len(row) and col_2sem < len(row):
+            v1 = parse_number_ptbr(row[col_1sem])
+            v2 = parse_number_ptbr(row[col_2sem])
+            
+            if v1 and v2 and v1 > 0 and v2 > 0:
+                # Se proporção muito desproporcional (>100:1)
+                if v2 > v1 * 100 or v1 > v2 * 100:
+                    ratio = max(v1, v2) / min(v1, v2)
+                    return {
+                        "severity": "WARN",
+                        "table": table["nome"],
+                        "rule": "disproportionate_distribution",
+                        "issue": "Distribuição muito desproporcional por período",
+                        "detail": f"'{row[0]}': 1º={v1:g}, 2º={v2:g} (proporção 1:{ratio:.0f})",
+                        "recommendation": "Verificar se distribuição por semestre está correta."
+                    }
     
-    if not has_nonzero:
-        return {
-            "severity": "FAIL",
-            "table": table["nome"],
-            "rule": "table_all_zero",
-            "issue": "Tabela integralmente zerada",
-            "detail": "Não há valores numéricos diferentes de zero.",
-            "recommendation": "Confirmar se dados deveriam existir; se sim, revisar extração."
-        }
     return None
 
-def rule_totals_divergence(table: Dict) -> Optional[Dict]:
-    """Divergência de totais - APENAS se linha Total existe"""
+def rule_abrupt_drop_series(table: Dict) -> Optional[Dict]:
+    """Detecta queda abrupta >50% em série de anos"""
     rows = table.get("rows_raw", [])
-    if not rows or len(rows) < 3:
+    headers = [normalize_text(h) for h in table.get("headers", [])]
+    
+    if len(rows) < 2:
         return None
     
+    year_cols = []
+    for col_idx, header in enumerate(headers):
+        if re.match(r'^20\d{2}$', header):
+            year_cols.append((col_idx, header))
+    
+    if len(year_cols) < 2:
+        return None
+    
+    for row in rows:
+        vals = []
+        for col_idx, year in year_cols:
+            if col_idx < len(row):
+                v = parse_number_ptbr(row[col_idx])
+                if v is not None and v > 0:
+                    vals.append((year, float(v)))
+        
+        if len(vals) >= 2:
+            for i in range(len(vals) - 1):
+                y0, v0 = vals[i]
+                y1, v1 = vals[i + 1]
+                
+                if v0 > 0:
+                    pct_change = ((v1 - v0) / v0) * 100
+                    # Queda >50% (ex: 52→4)
+                    if pct_change < -50:
+                        return {
+                            "severity": "WARN",
+                            "table": table["nome"],
+                            "rule": "abrupt_drop",
+                            "issue": f"Queda abrupta (>{abs(pct_change):.0f}%)",
+                            "detail": f"'{row[0]}': {y0}={v0:g} → {y1}={v1:g} ({pct_change:+.1f}%)",
+                            "recommendation": "Validar se é erro ou mudança real de critério/política."
+                        }
+    
+    return None
+
+def rule_sum_total_mismatch(table: Dict) -> Optional[Dict]:
+    """Detecta discrepância entre soma de linhas e total"""
+    rows = table.get("rows_raw", [])
+    
+    if len(rows) < 3:
+        return None
+    
+    # Procurar linha Total
     total_idx = None
     for i, row in enumerate(rows):
         if row and re.match(r'^\s*total\b', normalize_text(row[0]), flags=re.IGNORECASE):
@@ -255,221 +290,81 @@ def rule_totals_divergence(table: Dict) -> Optional[Dict]:
             break
     
     if total_idx is None or total_idx < 2:
-        return None  # Precisa de pelo menos 2 linhas antes do total
-    
-    n_cols = max(len(r) for r in rows) if rows else 0
-    numeric_cols = []
-    for c in range(1, min(n_cols, 6)):  # Apenas primeiras colunas
-        vals = 0
-        for r in rows[:total_idx]:
-            if c < len(r) and parse_number_ptbr(r[c]) is not None:
-                vals += 1
-        if vals >= 2:
-            numeric_cols.append(c)
-    
-    if not numeric_cols:
         return None
     
-    for c in numeric_cols:
-        s = 0.0
-        for r in rows[:total_idx]:
-            if c < len(r):
-                v = parse_number_ptbr(r[c])
-                if v is not None:
-                    s += float(v)
+    # Verificar coluna numérica
+    for col_idx in range(1, min(6, len(rows[0]) if rows else 0)):
+        soma = 0.0
+        has_vals = False
         
-        total_cell = rows[total_idx][c] if c < len(rows[total_idx]) else ""
+        for r in rows[:total_idx]:
+            if col_idx < len(r):
+                v = parse_number_ptbr(r[col_idx])
+                if v is not None:
+                    soma += float(v)
+                    has_vals = True
+        
+        if not has_vals:
+            continue
+        
+        total_cell = rows[total_idx][col_idx] if col_idx < len(rows[total_idx]) else ""
         total_val = parse_number_ptbr(total_cell)
+        
         if total_val is None:
             continue
         
-        tol = max(2.0, abs(s) * 0.01)  # 1% ou 2 unidades
-        if abs(s - float(total_val)) > tol:
+        # Se soma é significativamente diferente do total
+        diff = abs(soma - float(total_val))
+        if diff > max(10, abs(soma) * 0.05):
             return {
                 "severity": "FAIL",
                 "table": table["nome"],
-                "rule": "totals_divergence",
-                "issue": f"Divergência em total (coluna {c+1})",
-                "detail": f"Soma das linhas: {s:.1f} | Total declarado: {float(total_val):.1f}",
-                "recommendation": "Revisar cálculo do total ou linhas incluídas."
+                "rule": "sum_total_mismatch",
+                "issue": "Soma das linhas ≠ total declarado",
+                "detail": f"Coluna {col_idx+1}: soma={soma:g} vs total={float(total_val):g}",
+                "recommendation": "Recalcular total ou revisar linhas incluídas."
             }
     
     return None
 
-def rule_sharp_variation_in_series(table: Dict) -> Optional[Dict]:
-    """Quedas abruptas (>50%) ou aumentos expressivos (>200%) em séries temporais"""
-    headers = table.get("headers", [])
+def rule_blank_cells(table: Dict) -> Optional[Dict]:
+    """Detecta células em branco"""
     rows = table.get("rows_raw", [])
-    name = table.get("nome", "")
-    
-    if not rows or len(rows) < 2:
-        return None
-    
-    year_cols = []
-    for col_idx, header in enumerate(headers):
-        h = normalize_text(header)
-        if re.match(r'^20\d{2}$', h):
-            year_cols.append((col_idx, h))
-    
-    if len(year_cols) < 2:
-        return None  # Não é série temporal
-    
-    for r_i, row in enumerate(rows, 1):
-        categoria = normalize_text(row[0]) if row else f"Linha {r_i}"
-        values = []
-        for col_idx, year in year_cols:
-            if col_idx < len(row):
-                v = parse_number_ptbr(row[col_idx])
-                if v is not None and v > 0:
-                    values.append((year, float(v)))
-        
-        if len(values) < 2:
-            continue
-        
-        for i in range(len(values) - 1):
-            y0, v0 = values[i]
-            y1, v1 = values[i + 1]
-            
-            if v0 == 0:
-                continue
-            
-            var_pct = ((v1 - v0) / v0) * 100
-            
-            if var_pct < -50:  # Queda > 50%
-                return {
-                    "severity": "WARN",
-                    "table": table["nome"],
-                    "rule": "sharp_drop",
-                    "issue": f"Queda abrupta detectada (>{abs(var_pct):.0f}%)",
-                    "detail": f"'{categoria}': {y0}={v0:g} → {y1}={v1:g} ({var_pct:+.1f}%)",
-                    "recommendation": "Validar: mudança de critério, exclusões ou erro de extração?"
-                }
-            
-            if var_pct > 200:  # Aumento > 200%
-                return {
-                    "severity": "WARN",
-                    "table": table["nome"],
-                    "rule": "sharp_increase",
-                    "issue": f"Aumento expressivo detectado (>{var_pct:.0f}%)",
-                    "detail": f"'{categoria}': {y0}={v0:g} → {y1}={v1:g} ({var_pct:+.1f}%)",
-                    "recommendation": "Validar com a fonte: pode ser efeito real."
-                }
-    
-    return None
-
-def rule_duplicated_rows_same_label_only(table: Dict) -> Optional[Dict]:
-    """Duplicidade estrutural - APENAS se label/nome for IGUAL"""
-    rows = table.get("rows_raw", [])
-    if not rows or len(rows) < 2:
-        return None
-    
-    label_values = {}
-    for idx, row in enumerate(rows):
-        if not row:
-            continue
-        label = normalize_text(row[0]).lower()
-        if not label:
-            continue
-        sig = tuple(parse_number_ptbr(cell) for cell in row[1:])
-        
-        if label in label_values and label_values[label] != sig:
-            continue  # Labels iguais mas valores diferentes = OK
-        
-        if label in label_values and label_values[label] == sig:
-            # Labels iguais E valores iguais = erro
-            return {
-                "severity": "WARN",
-                "table": table["nome"],
-                "rule": "duplicated_rows_identical",
-                "issue": "Linha duplicada detectada",
-                "detail": f"Rótulo '{row[0]}' aparece duplicado com mesmos valores.",
-                "recommendation": "Remover duplicação."
-            }
-        
-        label_values[label] = sig
-    
-    return None
-
-def rule_spelling_errors(table: Dict) -> Optional[Dict]:
-    """Erros de ortografia/digitação comuns em PT-BR"""
-    name = table.get("nome", "")
-    headers = [normalize_text(h) for h in table.get("headers", [])]
-    rows = table.get("rows_raw", [])
-    
-    text = " ".join([name] + headers)
-    for row in rows[:20]:
-        text += " " + " ".join(row)
-    
-    # Alguns erros comuns
-    errors = {
-        r'\bobrigatatio\b': ('obrigatório', 'digitação'),
-        r'\bregulamente\b': ('regularmente', 'digitação'),
-        r'\bhabiiltação\b': ('habilitação', 'digitação'),
-        r'\bmunicipio\b': ('município', 'acentuação'),
-    }
-    
-    for pattern, (correct, type_) in errors.items():
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            return {
-                "severity": "WARN",
-                "table": table["nome"],
-                "rule": "spelling_error",
-                "issue": f"Erro de {type_} detectado",
-                "detail": f"Encontrado padrão suspeito; verificar '{correct}'.",
-                "recommendation": "Corrigir ortografia/digitação."
-            }
-    
-    return None
-
-def rule_inconsistent_uppercase(table: Dict) -> Optional[Dict]:
-    """Inconsistência de caixa alta (TOTAL vs Total vs total)"""
-    rows = table.get("rows_raw", [])
-    
     if not rows:
         return None
     
-    total_forms = set()
-    for row in rows:
-        if row:
-            label = row[0]
-            if label and re.search(r'\btotal\b', normalize_text(label), flags=re.IGNORECASE):
-                total_forms.add(label)
+    blanks = []
+    for r_i, row in enumerate(rows, 1):
+        for c_i, cell in enumerate(row, 1):
+            if normalize_text(cell) == "":
+                blanks.append((r_i, c_i))
+                if len(blanks) >= 8:
+                    break
+        if len(blanks) >= 8:
+            break
     
-    if len(total_forms) >= 2:
+    if blanks and len(blanks) > 3:
         return {
             "severity": "WARN",
             "table": table["nome"],
-            "rule": "inconsistent_uppercase",
-            "issue": "Inconsistência de caixa alta em 'Total'",
-            "detail": f"Formas encontradas: {', '.join(sorted(list(total_forms)[:5]))}",
-            "recommendation": "Padronizar (ex.: sempre 'Total')."
+            "rule": "blank_cells",
+            "issue": "Múltiplas células em branco",
+            "detail": f"Exemplos: {', '.join([f'(L{r},C{c})' for r,c in blanks[:6]])}",
+            "recommendation": "Preencher ou padronizar com zeros explícitos."
         }
-    
     return None
-
-# ============================================================
-# PIPELINE
-# ============================================================
 
 def analyze_table(table: Dict, base_year: int) -> List[Dict]:
     issues = []
     
-    # Parar se tabela vazia
-    issue = rule_table_all_zero(table)
-    if issue:
-        issues.append(issue)
-        return issues
-    
-    # Aplicar regras
     for rule in (
+        rule_missing_digit_in_number,
+        rule_identical_values_different_periods,
+        rule_missing_field_standardized_table,
+        rule_disproportionate_distribution,
+        rule_abrupt_drop_series,
+        rule_sum_total_mismatch,
         rule_blank_cells,
-        lambda t: rule_year_2024_check(t, base_year),
-        rule_thousand_separator_consistency,
-        rule_totals_divergence,
-        rule_sharp_variation_in_series,
-        rule_duplicated_rows_same_label_only,
-        rule_spelling_errors,
-        rule_inconsistent_uppercase,
     ):
         out = rule(table)
         if out:
@@ -488,7 +383,7 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
             "rule": "no_tables",
             "issue": "Nenhuma tabela encontrada",
             "detail": f"Status: {diag.get('status')}",
-            "recommendation": "Verificar URL ou renderização."
+            "recommendation": "Verificar URL."
         })
         return issues
     
@@ -496,7 +391,7 @@ def run_audit(url: str, report_year: int, base_year: int) -> List[Dict]:
         "severity": "PASS",
         "table": "Documento",
         "rule": "scan_ok",
-        "issue": f"✓ {diag['contagem_tables']} tabela(s) encontrada(s)",
+        "issue": f"✓ {diag['contagem_tables']} tabela(s)",
         "detail": f"HTML: {diag['tamanho_html_kb']:.1f} KB",
         "recommendation": "Analisando..."
     })
@@ -570,31 +465,28 @@ HTML_FRONTEND = """<!DOCTYPE html>
 <body>
     <div class="container">
         <h1>📋 Auditoria - Anuário UnB</h1>
-        <p class="subtitle">Análise de qualidade, consistência e conformidade de dados</p>
-
+        <p class="subtitle">Detecção de erros de digitação, dados faltantes e inconsistências</p>
         <div id="form">
             <div class="form-group">
                 <label>URL do Anuário</label>
-                <input type="url" id="url" value="https://anuariounb2025.netlify.app/">
+                <input type="url" id="url" value="https://anuario2024.netlify.app/">
             </div>
             <div class="form-row">
                 <div class="form-group">
                     <label>Ano do Anuário</label>
-                    <input type="number" id="year" value="2025">
+                    <input type="number" id="year" value="2024">
                 </div>
                 <div class="form-group">
                     <label>Ano-base</label>
-                    <input type="number" id="baseYear" value="2024">
+                    <input type="number" id="baseYear" value="2023">
                 </div>
             </div>
             <button onclick="audit()">🔍 Executar Auditoria</button>
         </div>
-
         <div id="loading">
             <div class="spinner"></div>
             <p>Auditando...</p>
         </div>
-
         <div id="results" class="results">
             <div class="stats" id="stats"></div>
             <h2 style="color: #003366; margin-bottom: 20px;">Resultados:</h2>
@@ -602,19 +494,15 @@ HTML_FRONTEND = """<!DOCTYPE html>
             <button class="export-button" onclick="downloadReport()">📥 Baixar Relatório (TXT)</button>
         </div>
     </div>
-
     <script>
-        let lastIssues = [], lastUrl = '', lastYear = 2025, lastBase = 2024;
-
+        let lastIssues = [], lastUrl = '', lastYear = 2024, lastBase = 2023;
         async function audit() {
             const url = document.getElementById('url').value;
             const year = parseInt(document.getElementById('year').value);
             const base = parseInt(document.getElementById('baseYear').value);
             lastUrl = url; lastYear = year; lastBase = base;
-
             document.getElementById('form').style.display = 'none';
             document.getElementById('loading').style.display = 'block';
-
             try {
                 const res = await fetch('/audit', {
                     method: 'POST',
@@ -630,18 +518,15 @@ HTML_FRONTEND = """<!DOCTYPE html>
                 document.getElementById('loading').style.display = 'none';
             }
         }
-
         function showResults(issues) {
             const pass = issues.filter(i => i.severity === 'PASS').length;
             const warn = issues.filter(i => i.severity === 'WARN').length;
             const fail = issues.filter(i => i.severity === 'FAIL').length;
-
             document.getElementById('stats').innerHTML = `
                 <div class="stat"><div class="stat-number" style="color: #4caf50;">${pass}</div><div>OK</div></div>
                 <div class="stat"><div class="stat-number" style="color: #ff9800;">${warn}</div><div>Avisos</div></div>
                 <div class="stat"><div class="stat-number" style="color: #f44336;">${fail}</div><div>Erros</div></div>
             `;
-
             document.getElementById('content').innerHTML = issues.map(i => `
                 <div class="issue-item ${i.severity.toLowerCase()}">
                     <div style="display: flex; justify-content: space-between;">
@@ -654,11 +539,9 @@ HTML_FRONTEND = """<!DOCTYPE html>
                     <div class="rule-tag">Regra: ${i.rule}</div>
                 </div>
             `).join('');
-
             document.getElementById('loading').style.display = 'none';
             document.getElementById('results').style.display = 'block';
         }
-
         function downloadReport() {
             fetch('/export/txt', {
                 method: 'POST',
@@ -701,8 +584,8 @@ def export_txt(data: dict):
     txt = generate_txt_report(
         issues=data.get("issues", []),
         url=data.get("url", ""),
-        report_year=int(data.get("report_year", 2025)),
-        base_year=int(data.get("base_year", 2024)),
+        report_year=int(data.get("report_year", 2024)),
+        base_year=int(data.get("base_year", 2023)),
     )
     return StreamingResponse(
         iter([txt.encode("utf-8")]),
